@@ -1,0 +1,24 @@
+# Google service account credentials — never commit this
+workspace/state/google-service-account.json
+google_service_account.json
+credentials*.json
+
+# Agent-generated outputs — not versioned
+agent/output/*.csv
+agent/output/*.json
+workspace/state/gaps.json
+workspace/state/suggestions.json
+workspace/state/last-run-summary.md
+workspace/state/checkpoint.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+/openclaw/
+
+# macOS
+.DS_Store
+.idea/
+/WhereToPublish.github.io/
