@@ -1,77 +1,19 @@
-"""fetch_sheet.py — Download a single Google Sheet tab as CSV using the public export URL.
+"""fetch_sheet.py — Download a single Google Sheet tab as CSV using the Sheets API.
 
 Usage:
-    python3 fetch_sheet.py [--gid GID] [--output OUTPUT_PATH]
+    python3 fetch_sheet.py [--field FIELD] [--output OUTPUT_PATH] [--credentials PATH]
 
-By default downloads the Genetics & Genomics tab (gid=1379563174) to
-agent/output/raw_genetics_genomics.csv.
+By default downloads the Genetics & Genomics tab to agent/output/raw_genetics_genomics.csv.
 
-No authentication required — uses the public /pub?gid=...&output=csv endpoint.
+Requires a Google service-account credentials file. Set GOOGLE_SERVICE_ACCOUNT_KEY or
+place the key at ~/.config/wheretopublish/google_service_account.json.
 """
 
 import argparse
-import urllib.request
-import urllib.error
 import sys
-import os
 from pathlib import Path
 
-# Public spreadsheet export base URL (read-only, no auth needed)
-SPREADSHEET_BASE_URL = (
-    "https://docs.google.com/spreadsheets/d/e/"
-    "2PACX-1vTw97FS3eOFbYlqY8j7wWrBd3yrDaG6hqPclYJdPrnvd7t9U2DNz5xXNK4F0iesyHIKEkx9weLz-69a"
-    "/pub"
-)
-
-# Tab GIDs keyed by field name
-SHEET_GIDS = {
-    "generalist": "897920130",
-    "anatomy_physiology": "507847855",
-    "cancer": "14394643",
-    "development": "1596020802",
-    "ecology_evolution": "1379256167",
-    "genetics_genomics": "1379563174",
-    "immunology": "1030012941",
-    "molecular_cellular_biology": "86261319",
-    "neurosciences": "312916140",
-    "plants": "818438400",
-}
-
-
-def download_tab(gid: str, output_path: str) -> None:
-    """Download a Google Sheet tab by GID to a local CSV file."""
-    url = f"{SPREADSHEET_BASE_URL}?gid={gid}&single=true&output=csv"
-    print(f"Downloading gid={gid} from:\n  {url}")
-
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
-
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            content = response.read()
-
-        with open(output_path, "wb") as f:
-            f.write(content)
-
-        # Quick sanity check
-        lines = content.decode("utf-8", errors="replace").splitlines()
-        print(f"  Saved {len(lines)} rows to {output_path}")
-        if lines:
-            print(f"  Header: {lines[0][:120]}")
-    except urllib.error.HTTPError as e:
-        print(f"ERROR: HTTP {e.code} — {e.reason}", file=sys.stderr)
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        print(f"ERROR: {e.reason}", file=sys.stderr)
-        sys.exit(1)
+import sheets_client
 
 
 def main() -> None:
@@ -80,22 +22,41 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Download a WhereToPublish Google Sheet tab as CSV.")
     parser.add_argument(
-        "--gid",
-        default=SHEET_GIDS["genetics_genomics"],
-        help=f"Sheet GID (default: {SHEET_GIDS['genetics_genomics']} = Genetics & Genomics). "
-             f"Available: {list(SHEET_GIDS.keys())}",
+        "--field",
+        choices=list(sheets_client.SHEET_TAB_NAMES.keys()),
+        default="genetics_genomics",
+        help=f"Field slug to download (default: genetics_genomics). Available: {list(sheets_client.SHEET_TAB_NAMES.keys())}",
     )
     parser.add_argument(
-        "--field",
-        choices=list(SHEET_GIDS.keys()),
-        default=None,
-        help="Field name (alternative to --gid). Overrides --gid if both are given.",
+        "--output",
+        default=default_output,
+        help=f"Output CSV path (default: {default_output})",
     )
-    parser.add_argument("--output", default=default_output, help=f"Output CSV path (default: {default_output})")
+    parser.add_argument(
+        "--credentials",
+        type=Path,
+        default=None,
+        help="Path to service-account JSON key (default: GOOGLE_SERVICE_ACCOUNT_KEY env var or ~/.config/wheretopublish/google_service_account.json)",
+    )
     args = parser.parse_args()
 
-    gid = SHEET_GIDS[args.field] if args.field else args.gid
-    download_tab(gid, args.output)
+    tab_name = sheets_client.SHEET_TAB_NAMES[args.field]
+    dest = Path(args.output)
+
+    print(f"Downloading tab '{tab_name}' via Sheets API ...")
+    try:
+        service = sheets_client.get_sheets_service(credentials_path=args.credentials, readonly=True)
+        rows = sheets_client.download_tab_as_csv(service, tab_name, dest)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"  Saved {len(rows)} rows to {dest}")
+    if rows:
+        print(f"  Header: {','.join(rows[0])[:120]}")
 
 
 if __name__ == "__main__":

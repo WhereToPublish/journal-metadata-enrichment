@@ -25,6 +25,8 @@ import urllib.error
 from pathlib import Path
 from datetime import date, datetime
 
+import sheets_client as _sheets_client
+
 # ---------------------------------------------------------------------------
 # Paths and constants
 # ---------------------------------------------------------------------------
@@ -34,13 +36,6 @@ PROJECT_ROOT = Path(".")
 OUTPUT_DIR = PROJECT_ROOT / "agent" / "output"
 
 DEFAULT_WTP_DIR = PROJECT_ROOT / "WhereToPublish.github.io"
-
-SPREADSHEET_BASE_URL = (
-    "https://docs.google.com/spreadsheets/d/e/"
-    "2PACX-1vTw97FS3eOFbYlqY8j7wWrBd3yrDaG6hqPclYJdPrnvd7t9U2DNz5xXNK4F0iesyHIKEkx9weLz-69a"
-    "/pub"
-)
-GID_GENETICS_GENOMICS = "1379563174"
 
 URL_OPENAPC = "https://github.com/OpenAPC/openapc-de/raw/refs/heads/master/data/apc_de.csv"
 URL_DOAJ = "https://doaj.org/csv"
@@ -273,30 +268,23 @@ def _download_dataverse_apc(dest: Path) -> bool:
         return False
 
 
-def download_genetics_genomics_csv(wtp_dir: Path) -> None:
+def download_genetics_genomics_csv(wtp_dir: Path, credentials_path: Path | None = None) -> None:
     """Download the Genetics & Genomics sheet to data_extracted/genetics_genomics.csv."""
     data_extracted = wtp_dir / "data_extracted"
     data_extracted.mkdir(parents=True, exist_ok=True)
     dest = data_extracted / "genetics_genomics.csv"
 
-    url = f"{SPREADSHEET_BASE_URL}?gid={GID_GENETICS_GENOMICS}&single=true&output=csv"
-    log(f"Downloading Genetics & Genomics sheet ...")
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
-    req = urllib.request.Request(url, headers=headers)
+    log("Downloading Genetics & Genomics sheet via Sheets API ...")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read()
-        dest.write_bytes(data)
-        lines = data.decode("utf-8", errors="replace").splitlines()
-        log(f"  Genetics & Genomics: {len(lines)} rows downloaded")
-    except Exception as e:
-        log(f"ERROR: Could not download Genetics & Genomics sheet: {e}")
+        service = _sheets_client.get_sheets_service(credentials_path=credentials_path, readonly=True)
+        rows = _sheets_client.download_tab_as_csv(
+            service,
+            _sheets_client.SHEET_TAB_NAMES["genetics_genomics"],
+            dest,
+        )
+        log(f"  Genetics & Genomics: {len(rows)} rows downloaded")
+    except Exception as exc:
+        log(f"ERROR: Could not download Genetics & Genomics sheet: {exc}")
         sys.exit(1)
 
 
@@ -506,6 +494,12 @@ def main() -> None:
         default=OUTPUT_DIR / "gap_report.json",
         help="Where to write gap_report.json",
     )
+    parser.add_argument(
+        "--credentials",
+        type=Path,
+        default=None,
+        help="Path to service-account JSON key (default: GOOGLE_SERVICE_ACCOUNT_KEY env var or ~/.config/wheretopublish/google_service_account.json)",
+    )
     args = parser.parse_args()
 
     wtp_dir: Path = args.wtp_dir
@@ -520,7 +514,7 @@ def main() -> None:
 
     if not args.skip_download:
         ensure_extraction_data(wtp_dir)
-        download_genetics_genomics_csv(wtp_dir)
+        download_genetics_genomics_csv(wtp_dir, credentials_path=args.credentials)
     else:
         log("Skipping download (--skip-download set)")
 

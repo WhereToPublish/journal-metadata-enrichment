@@ -9,11 +9,17 @@ The current end-to-end flow is:
 ```text
 run_agent.sh
   -> agent/scripts/gap_analysis.py (unless skipped)
+    -> Google Sheets API (sheets_client.py) — downloads Genetics & Genomics tab
+    -> external data sources (OpenAPC, DOAJ, Scimago, PCI, Dataverse)
+    -> WhereToPublish pipeline (update_extracted.py → data_process.py)
   -> agent/scripts/run_enrichment.py
     -> agent/scripts/openclaw_runtime.py
     -> one OpenClaw session per journal
     -> agent/scripts/suggestions_io.py
   -> agent/output/*
+
+agent/scripts/upload_suggestions.py  (run manually after enrichment)
+  -> Google Sheets API (sheets_client.py) — writes AI_suggestions tab
 ```
 
 Key runtime properties:
@@ -25,6 +31,7 @@ Key runtime properties:
 - the agent works only on journals already present in the selected backlog
 - Python owns CSV, state, checkpoint, and log persistence
 - unresolved is the normal fallback when evidence is weak or blocked
+- Google Sheets API (service-account auth) is used for all spreadsheet I/O: downloading tabs and uploading suggestions
 
 ## Root Files
 
@@ -60,8 +67,36 @@ Current model behavior:
 - extra launcher arguments are forwarded directly to `run_enrichment.py`
 
 ## Python Modules
+### agent/scripts/sheets_client.py
 
-### agent/scripts/enrichment_common.py
+Shared Google Sheets API module.
+
+- defines `SPREADSHEET_ID` and `DEFAULT_CREDENTIALS_PATH` (resolved from `GOOGLE_SERVICE_ACCOUNT_KEY` env var or `~/.config/wheretopublish/google_service_account.json`)
+- defines `SHEET_TAB_NAMES` mapping field slugs to actual Google Sheets tab names
+- provides `get_sheets_service(credentials_path, readonly)` — returns an authenticated Sheets API v4 service
+- provides `download_tab_as_csv(service, tab_name, dest_path)` — downloads a tab and writes it as CSV
+- provides `get_or_create_tab`, `clear_tab`, and `write_rows` helpers used by the upload script
+
+### agent/scripts/fetch_sheet.py
+
+Standalone utility for downloading any spreadsheet tab via the Sheets API.
+
+- downloads any tab by `--field` slug (e.g. `genetics_genomics`)
+- uses `sheets_client.get_sheets_service()` and `sheets_client.download_tab_as_csv()`
+- accepts optional `--output` and `--credentials` arguments
+- replaces the former public export URL approach (no GIDs, no unauthenticated requests)
+
+### agent/scripts/upload_suggestions.py
+
+Upload script for staging suggestions in the Google Sheet.
+
+- reads `AI_Suggestions.csv` (default: `agent/output/AI_Suggestions.csv`)
+- creates or reuses the `AI_suggestions` tab in the spreadsheet
+- clears existing content and writes a fresh header + data rows
+- prepends an `Approve?` checkbox column (initially `FALSE`) for human review
+- accepts optional `--input` and `--credentials` arguments
+
+
 
 Shared constants and schemas.
 
@@ -74,10 +109,12 @@ Shared constants and schemas.
 
 Pipeline refresh and gap discovery.
 
-- refreshes the Genetics & Genomics sheet and external-source inputs
+- downloads the Genetics & Genomics sheet via the Google Sheets API (using `sheets_client`)
+- downloads external-source inputs (OpenAPC, DOAJ, Scimago, PCI, Dataverse)
 - runs the WTP pipeline unless skipped
 - writes `agent/output/gap_report.json`
-- now records `wtp_dir` as `WhereToPublish.github.io` when run from the repo root
+- records `wtp_dir` as `WhereToPublish.github.io` when run from the repo root
+- accepts optional `--credentials` argument forwarded to the Sheets API call
 
 ### agent/scripts/run_enrichment.py
 
@@ -119,7 +156,7 @@ Persistence and sanitization layer.
 
 ### agent/scripts/fetch_sheet.py
 
-Still present as a standalone utility for direct sheet export, but it is not the main launcher path.
+Standalone utility for downloading any spreadsheet tab via the Sheets API. Uses `sheets_client` for authentication; accepts `--field`, `--output`, and `--credentials`. Not used in the main launcher path.
 
 ## Removed Python Surface
 
@@ -156,6 +193,8 @@ The effective contract between Python and the model is:
 - the model owns research and browsing, not file mutation
 - Python decides what gets persisted
 - if no row survives validation, the journal is treated as unresolved
+- accepted suggestions are staged in `agent/output/AI_Suggestions.csv` and pushed to the `AI_suggestions` spreadsheet tab via `upload_suggestions.py`
+- the spreadsheet's data tabs are only modified by a human using the Apps Script review workflow
 
 ## Outputs
 
@@ -187,7 +226,9 @@ The implementation has been validated with real launcher runs.
 
 Validated behavior:
 
-- the full launcher refreshes the gap report and writes `wtp_dir: "WhereToPublish.github.io"`
+- the full launcher refreshes the gap report and downloads the Genetics & Genomics sheet via the Sheets API
+- `fetch_sheet.py` downloads any tab by field slug using the Sheets API
+- `upload_suggestions.py` clears and rewrites the `AI_suggestions` spreadsheet tab with current suggestions and an `Approve?` checkbox column
 - blocked-source cases such as `Human Genomics` stay unresolved with no persisted rows
 - supported cases can persist a narrow subset of requested fields, for example `Business model = Hybrid` for `Plant Genetic Resources`
 - when the model returns structurally valid but unsupported guesses, the validator drops them instead of writing them
