@@ -103,7 +103,7 @@ Fields the pipeline NEVER overwrites (always defer to manual curation):
 
 ---
 
-## 3. The 4 Agent Goals
+## 3. The Active Agent Goals
 
 ### Goal 1: Fill Empty Cells (Most Common)
 Journals still have empty cells after enrichment because:
@@ -124,17 +124,14 @@ Signs of an error:
 
 Only correct if you have strong evidence (confidence ≥ 0.75).
 
-### Goal 3: Add Missing Journals
-If you discover a journal that clearly belongs in Genetics & Genomics and is not in the sheet:
-- Must be an active peer-reviewed journal
-- Must have ≥2 independent sources confirming it exists
-- Set `suggestion_type = "add"` and provide ALL fields you can find
-- Confidence threshold for adding: ≥ 0.80
-
-### Goal 4: Flag Non-Existent Journals
+### Goal 3: Flag Non-Existent Journals
 If after checking DOAJ + Scimago + CrossRef + Google, you find no trace of a journal:
 - Set `suggestion_type = "remove"`, `field = "Journal"`, `suggested_value = "REMOVE"`
 - Confidence threshold for removal: ≥ 0.90 (very high — do not remove on ambiguity)
+
+Out of scope for this runtime:
+- Do not propose adding new journals.
+- Work only on journals already present in the caller-provided backlog.
 
 ---
 
@@ -161,8 +158,9 @@ If after checking DOAJ + Scimago + CrossRef + Google, you find no trace of a jou
 
 ## 5. Suggestion Output Format
 
-Write one row per suggestion to:
-`/Users/tlatrille/Documents/journal-metadata-enrichment/agent/output/AI_Suggestions.csv`
+In automated one-journal mode, return suggestion objects in JSON to the caller.
+The caller persists accepted rows to `agent/output/AI_Suggestions.csv`.
+Do not write that file directly unless the caller explicitly asks for file mutation.
 
 ### Column Schema (exact, in this order)
 ```
@@ -178,14 +176,13 @@ journal,field,current_value,suggested_value,confidence,source_urls,reasoning,sug
 | `confidence` | float | 0.00–1.00 |
 | `source_urls` | string | Pipe-separated (`\|`) list of URLs actually visited |
 | `reasoning` | string | 1–2 sentences explaining the evidence |
-| `suggestion_type` | string | `fill` / `alt_name` / `correct` / `add` / `remove` |
+| `suggestion_type` | string | `fill` / `alt_name` / `correct` / `remove` |
 | `priority` | string | `high` / `medium` / `low` |
 
 ### suggestion_type Values
 - `fill` — adding a value to an empty field
 - `alt_name` — providing/correcting the `Scimago Journal Title` to fix a failed pipeline join
 - `correct` — changing an existing (wrong) value
-- `add` — a new journal row to add to the sheet
 - `remove` — flag a journal for removal (non-existent)
 
 ### Priority Rules
@@ -212,34 +209,18 @@ journal,field,current_value,suggested_value,confidence,source_urls,reasoning,sug
 
 ```
 START
-  │
-  ├─ Step 1: Run gap_analysis.py (or read existing gap_report.json)
-  │          exec: python3 agent/scripts/gap_analysis.py
-  │
-  ├─ Step 2: Read agent/output/gap_report.json
-  │          → sorted list of journals with gaps, by priority
-  │
-  ├─ Step 3: Initialize AI_Suggestions.csv with header row
-  │          write: agent/output/AI_Suggestions.csv
-  │
-  ├─ Step 4: For each journal in gap_report.json["journals"] (in order):
-  │
-  │    ├─ 4a: Read journal name, website, and gaps[]
-  │    │
-  │    ├─ 4b: For gap_type="alt_name" gaps (missing Scimago data):
-  │    │       → Search Scimago for journal name variations
-  │    │       → If found under different name: suggest alt_name with confidence
-  │    │
-  │    ├─ 4c: For gap_type="fill" gaps (missing field values):
-  │    │       → Check DOAJ → publisher site → CrossRef
-  │    │       → Collect evidence + score confidence
-  │    │       → If confidence ≥ 0.55: write suggestion row
-  │    │
-  │    ├─ 4d: Every 10 journals processed: write checkpoint CSV
-  │    │
-  │    └─ 4e: Stop when ~50 suggestions accumulated OR all HIGH+MEDIUM done
-  │
-  └─ Step 5: Finalize AI_Suggestions.csv and write summary to memory
+    │
+    ├─ Step 1: Read the caller-provided journal name, known metadata, requested gaps, and lookup URLs.
+    │
+    ├─ Step 2: Fetch the provided official website, DOAJ lookup URL, and Scimago lookup URL.
+    │
+    ├─ Step 3: If those sources are insufficient, use other public sources such as CrossRef.
+    │
+    ├─ Step 4: Score evidence using the source hierarchy and confidence rules above.
+    │
+    ├─ Step 5: Return one JSON object containing only supported suggestions for requested fields.
+    │
+    └─ Step 6: If evidence is insufficient, return `status: "unresolved"` with an empty suggestions array.
 ```
 
 ---
@@ -247,7 +228,8 @@ START
 ## 7. Key Do-Nots
 - Do NOT use ISSN — this database has no ISSN column.
 - Do NOT modify WhereToPublish.github.io/ files directly.
-- Do NOT write to the Google Sheet — only to AI_Suggestions.csv.
+- Do NOT write to the Google Sheet.
+- Do NOT write to `AI_Suggestions.csv` directly in automated one-journal runs.
 - Do NOT hallucinate URLs — only cite pages you actually browsed.
 - Do NOT use Docker or containers.
 - Do NOT schedule runs — this is manual-start only.
@@ -257,7 +239,7 @@ START
 ---
 
 ## 8. Useful URLs for Research
-- DOAJ search: `https://doaj.org/search#journals?query=<JOURNAL_NAME>`
+- DOAJ search: `https://doaj.org/search/journals/<JOURNAL_NAME>`
 - DOAJ journal page: `https://doaj.org/toc/<ISSN>` (if ISSN known from DOAJ search)
 - Scimago search: `https://www.scimagojr.com/journalsearch.php?q=<JOURNAL_NAME>`
 - CrossRef search: `https://search.crossref.org/?q=<JOURNAL_NAME>&from_ui=yes`

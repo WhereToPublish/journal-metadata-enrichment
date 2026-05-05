@@ -1,126 +1,148 @@
 #!/usr/bin/env bash
-# run_agent.sh — Start the JournalMind OpenClaw agent for WhereToPublish enrichment.
-#
-# Usage:
-#   ./run_agent.sh
-#
-# What it does:
-#   1. Activates the Python virtualenv (for gap_analysis.py)
-#   2. Points OpenClaw at the project-local workspace
-#   3. Restarts (or starts) the OpenClaw gateway
-#   4. Opens the WebChat dashboard in your browser
-#   5. Prints the task message to paste into the WebChat
-#
-# To stop the agent: run `openclaw gateway stop`
-# To revert to your original workspace: run `openclaw config unset agents.defaults.workspace`
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKSPACE="$SCRIPT_DIR/agent/workspace"
-VENV_PYTHON="/Users/tlatrille/Documents/venv/py312stats/bin/python3"
+cd "$SCRIPT_DIR"
 
-# ── Preflight checks ────────────────────────────────────────────────────────
+WORKSPACE="agent/workspace"
+DEFAULT_OUTPUT_DIR="agent/output"
+DEFAULT_LOG_DIR="$DEFAULT_OUTPUT_DIR/logs"
+DEFAULT_STATE_DIR="$DEFAULT_OUTPUT_DIR/state"
+VENV_PYTHON="${JOURNALMIND_PYTHON:-.venv/bin/python}"
+MODEL="${JOURNALMIND_MODEL:-ollama/qwen3:8b}"
+MODEL_TAG="${MODEL#ollama/}"
+RUNNER_OUTPUT="$DEFAULT_OUTPUT_DIR/AI_Suggestions.csv"
+RUNNER_STATE="$DEFAULT_STATE_DIR/run_state.json"
+RUNNER_LOG_DIR="$DEFAULT_LOG_DIR"
+
+parse_runner_paths() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output)
+        RUNNER_OUTPUT="$2"
+        shift 2
+        ;;
+      --output=*)
+        RUNNER_OUTPUT="${1#*=}"
+        shift
+        ;;
+      --state)
+        RUNNER_STATE="$2"
+        shift 2
+        ;;
+      --state=*)
+        RUNNER_STATE="${1#*=}"
+        shift
+        ;;
+      --log-dir)
+        RUNNER_LOG_DIR="$2"
+        shift 2
+        ;;
+      --log-dir=*)
+        RUNNER_LOG_DIR="${1#*=}"
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+}
+
+parse_runner_paths "$@"
+
+RUN_ID="$(date +"%Y%m%d-%H%M%S")"
+MERGED_LOG="$RUNNER_LOG_DIR/run-$RUN_ID.console.log"
+OPENCLAW_JSON_LOG="$RUNNER_LOG_DIR/run-$RUN_ID.openclaw.jsonl"
+RUNNER_LOG="$RUNNER_LOG_DIR/run-$RUN_ID.runner.log"
+DEFAULT_ARGS=(--priorities high,medium --max-suggestions 50)
+RUNNER_ARGS=("${DEFAULT_ARGS[@]}" "$@")
+OPENCLAW_LOG_PID=""
+
+cleanup() {
+  if [[ -n "$OPENCLAW_LOG_PID" ]] && kill -0 "$OPENCLAW_LOG_PID" 2>/dev/null; then
+    kill "$OPENCLAW_LOG_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
 
 echo "=== JournalMind — WhereToPublish Metadata Enrichment Agent ==="
-echo ""
+echo
 
-# Check OpenClaw is installed
-if ! command -v openclaw &>/dev/null; then
+mkdir -p "$RUNNER_LOG_DIR" "$(dirname "$RUNNER_STATE")" "$(dirname "$RUNNER_OUTPUT")"
+
+if ! command -v openclaw >/dev/null 2>&1; then
   echo "ERROR: 'openclaw' not found in PATH."
   echo "Install it with: npm install -g openclaw"
   exit 1
 fi
 
-# Check Ollama is running
-if ! ollama list &>/dev/null; then
-  echo "WARNING: Ollama does not appear to be running."
-  echo "Start it with: ollama serve"
-  echo "Then re-run this script."
-  echo ""
-  echo "Recommended models for 32 GB M2 (choose one):"
-  echo "  ollama pull qwen3:8b         # Best tool-calling support, ~5 GB"
-  echo "  ollama pull qwen3:14b        # Better reasoning, ~9 GB"
-  echo "  ollama pull qwen3:30b-a3b    # Faster MoE, ~18 GB"
-  echo ""
-  read -rp "Continue anyway? (y/N) " ans
-  [[ "${ans,,}" == "y" ]] || exit 1
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "ERROR: 'ollama' not found in PATH."
+  exit 1
 fi
 
-# Check Python virtualenv
+if ! ollama list >/dev/null 2>&1; then
+  echo "ERROR: Ollama is not responding. Start it with: ollama serve"
+  exit 1
+fi
+
+OLLAMA_MODELS="$(ollama list)"
+if ! grep -q "^${MODEL_TAG}[[:space:]]" <<<"$OLLAMA_MODELS"; then
+  echo "ERROR: Model '$MODEL_TAG' is not available in Ollama."
+  echo "Pull it first with: ollama pull $MODEL_TAG"
+  exit 1
+fi
+
 if [[ ! -x "$VENV_PYTHON" ]]; then
-  echo "WARNING: Python virtualenv not found at $VENV_PYTHON"
-  echo "Gap analysis will try system python3 instead."
-  VENV_PYTHON="python3"
+  echo "ERROR: Python virtualenv not found at $VENV_PYTHON"
+  exit 1
 fi
 
-# ── Configure OpenClaw workspace ────────────────────────────────────────────
-
-echo "Configuring OpenClaw workspace: $WORKSPACE"
-openclaw config set agents.defaults.workspace "$WORKSPACE"
-
-# Confirm the model is set; read from openclaw.json directly (openclaw config get is not available)
-OPENCLAW_JSON="$HOME/.openclaw/openclaw.json"
-CURRENT_MODEL=$(python3 -c "import json,sys; d=json.load(open('$OPENCLAW_JSON')); print(d.get('agents',{}).get('defaults',{}).get('model',{}).get('primary',''))" 2>/dev/null || echo "")
-if [[ -z "$CURRENT_MODEL" || "$CURRENT_MODEL" == "null" ]]; then
-  echo ""
-  echo "No primary model configured. Set one now:"
-  echo "  openclaw config set agents.defaults.model.primary ollama/qwen2.5:14b"
-  echo ""
-  echo "Or for larger models (32 GB M2):"
-  echo "  openclaw config set agents.defaults.model.primary ollama/qwen2.5:32b"
-  echo ""
-  read -rp "Enter model name (e.g. ollama/qwen2.5:14b) or press Enter to skip: " model_name
-  if [[ -n "$model_name" ]]; then
-    openclaw config set agents.defaults.model.primary "$model_name"
-    echo "Model set to: $model_name"
-  fi
-else
-  echo "Model: $CURRENT_MODEL"
+if ! "$VENV_PYTHON" -c "import polars" >/dev/null 2>&1; then
+  echo "ERROR: '$VENV_PYTHON' cannot import polars."
+  echo "Install dependencies with: $VENV_PYTHON -m pip install -r requirements.txt"
+  exit 1
 fi
 
-# ── Start / restart gateway ──────────────────────────────────────────────────
+echo "Workspace : $WORKSPACE"
+echo "Model     : $MODEL"
+echo "Logs      : $MERGED_LOG"
+echo "Python    : $VENV_PYTHON"
+echo
 
-echo ""
-echo "Starting OpenClaw gateway ..."
+echo "Configuring OpenClaw workspace and model ..."
+openclaw config set agents.defaults.workspace "$SCRIPT_DIR/$WORKSPACE"
+openclaw config set agents.defaults.model.primary "$MODEL"
 
-# Install LaunchAgent if not yet done (idempotent)
-openclaw gateway install 2>/dev/null || true
+echo "Restarting OpenClaw gateway ..."
+openclaw gateway install >/dev/null 2>&1 || true
+openclaw gateway restart >/dev/null 2>&1 || openclaw gateway start >/dev/null 2>&1
 
-# Restart so the new workspace config is picked up
-# (openclaw gateway restart handles both "was running" and "was stopped" cases)
-openclaw gateway restart 2>/dev/null || openclaw gateway start 2>/dev/null || true
+echo "Starting OpenClaw live log capture ..."
+openclaw logs --follow --json 2>&1 \
+  | tee "$OPENCLAW_JSON_LOG" \
+  | sed 's/^/[openclaw] /' \
+  | tee -a "$MERGED_LOG" &
+OPENCLAW_LOG_PID=$!
 
-# Give it a moment to come up
-sleep 3
+echo "Starting enrichment runner ..."
+echo "Runner args: ${RUNNER_ARGS[*]}"
+echo
 
-# ── Open dashboard ───────────────────────────────────────────────────────────
+"$VENV_PYTHON" agent/scripts/run_enrichment.py "${RUNNER_ARGS[@]}" 2>&1 \
+  | tee "$RUNNER_LOG" \
+  | sed 's/^/[runner] /' \
+  | tee -a "$MERGED_LOG"
 
-echo ""
-echo "Opening WebChat dashboard at http://127.0.0.1:18789 ..."
-open "http://127.0.0.1:18789" 2>/dev/null || true
-
-# ── Print task message ───────────────────────────────────────────────────────
-
-echo ""
-echo "══════════════════════════════════════════════════════════════"
-echo "Paste this message into the WebChat to start the enrichment:"
-echo "══════════════════════════════════════════════════════════════"
-echo ""
-cat <<'MSG'
-Start the journal enrichment task for Genetics & Genomics.
-
-1. Run gap_analysis.py to download the latest data and identify missing metadata.
-2. Research each HIGH-priority gap first, then MEDIUM-priority gaps.
-3. For each journal, check DOAJ, the publisher website, and Scimago.
-4. Write all suggestions (with sources and confidence scores) to:
-   /Users/tlatrille/Documents/journal-metadata-enrichment/agent/output/AI_Suggestions.csv
-5. Checkpoint every 10 journals.
-6. Stop when you have ~50 high-confidence suggestions or all HIGH/MEDIUM gaps are processed.
-7. End with a brief summary of what was found, what was skipped, and why.
-MSG
-echo ""
-echo "══════════════════════════════════════════════════════════════"
-echo ""
-echo "To stop the agent later: openclaw gateway stop"
-echo "To revert workspace:     openclaw config unset agents.defaults.workspace"
+echo
+echo "Run finished."
+echo "Merged log    : $MERGED_LOG"
+echo "OpenClaw log  : $OPENCLAW_JSON_LOG"
+echo "Runner log    : $RUNNER_LOG"
+echo "Suggestions   : $RUNNER_OUTPUT"
+echo "State         : $RUNNER_STATE"
+echo
+echo "To stop the gateway later: openclaw gateway stop"
+echo "To revert workspace:      openclaw config unset agents.defaults.workspace"

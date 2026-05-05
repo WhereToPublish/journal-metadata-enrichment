@@ -30,7 +30,7 @@ from datetime import date, datetime
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).parent
-PROJECT_ROOT = SCRIPT_DIR.parent.parent
+PROJECT_ROOT = Path(".")
 OUTPUT_DIR = PROJECT_ROOT / "agent" / "output"
 
 DEFAULT_WTP_DIR = PROJECT_ROOT / "WhereToPublish.github.io"
@@ -69,6 +69,13 @@ ENRICHMENT_FIELDS = {"Business model", "Publisher", "Country", "Website", "APC E
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
 
 
 # ---------------------------------------------------------------------------
@@ -390,10 +397,10 @@ def build_gap_report(wtp_dir: Path) -> dict:
     enriched_path = wtp_dir / "data" / "genetics_genomics.csv"
 
     if not raw_path.exists():
-        log(f"ERROR: Raw CSV not found: {raw_path}")
+        log(f"ERROR: Raw CSV not found: {display_path(raw_path)}")
         sys.exit(1)
     if not enriched_path.exists():
-        log(f"ERROR: Enriched CSV not found: {enriched_path}")
+        log(f"ERROR: Enriched CSV not found: {display_path(enriched_path)}")
         sys.exit(1)
 
     raw_rows = load_csv_as_dicts(raw_path)
@@ -451,7 +458,7 @@ def build_gap_report(wtp_dir: Path) -> dict:
 
     return {
         "run_date": date.today().isoformat(),
-        "wtp_dir": str(wtp_dir),
+        "wtp_dir": display_path(wtp_dir),
         "tab": "Genetics & Genomics",
         "total_journals": len(raw_rows),
         "journals_with_gaps": len(journals_with_gaps),
@@ -501,15 +508,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    wtp_dir: Path = args.wtp_dir.resolve()
+    wtp_dir: Path = args.wtp_dir
 
     if not wtp_dir.exists():
-        log(f"ERROR: WTP directory not found: {wtp_dir}")
+        log(f"ERROR: WTP directory not found: {display_path(wtp_dir)}")
         sys.exit(1)
 
     log(f"=== WhereToPublish Gap Analysis ===")
-    log(f"WTP dir: {wtp_dir}")
-    log(f"Output : {args.output}")
+    log(f"WTP dir: {display_path(wtp_dir)}")
+    log(f"Output : {display_path(args.output)}")
 
     if not args.skip_download:
         ensure_extraction_data(wtp_dir)
@@ -529,7 +536,7 @@ def main() -> None:
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    log(f"=== Gap Report Written: {args.output} ===")
+    log(f"=== Gap Report Written: {display_path(args.output)} ===")
     log(f"  Total journals      : {report['total_journals']}")
     log(f"  Journals with gaps  : {report['journals_with_gaps']}")
     log(f"  Total gap instances : {report['total_gap_instances']}")

@@ -1,245 +1,145 @@
-# WhereToPublish — Journal Metadata Enrichment Agent
+# WhereToPublish Journal Metadata Enrichment
 
-An AI agent that automatically researches missing journal metadata for the
-[WhereToPublish](https://wheretopublish.github.io/) project and produces
-structured suggestions for human review.
+Local OpenClaw + Ollama tooling for generating reviewable journal metadata suggestions for the WhereToPublish project.
 
----
+## Current Workflow
 
-## What This Is
+The current runtime is built around one journal per OpenClaw session.
 
-WhereToPublish is a curated database of biology journals that helps researchers choose
-where to publish based on open-access status, APCs, publisher type, and other criteria.
-The database is maintained manually in Google Sheets and enriched by an automated pipeline
-that joins against Scimago, OpenAPC, and DOAJ.
+1. `run_agent.sh` is the only entry point.
+2. The launcher uses the repo-local `.venv/bin/python`, checks that `polars` is importable, configures the OpenClaw workspace, and starts live logs.
+3. `agent/scripts/gap_analysis.py` refreshes the WhereToPublish pipeline and writes `agent/output/gap_report.json` unless `--skip-gap-analysis` is passed.
+4. `agent/scripts/run_enrichment.py` selects journals from the gap report and opens one fresh OpenClaw session per journal.
+5. OpenClaw does the journal-level research with tools and returns one JSON object.
+6. Python validates that JSON and writes only accepted rows to `agent/output/AI_Suggestions.csv` plus run state and logs.
 
-**The problem**: many journals are not matched by the pipeline because their name in the
-sheet differs from their name in external databases, or they are too niche/new to appear
-there at all. This leaves many cells empty.
+The system never writes directly to the Google Sheet. Persisted suggestions are always for human review.
 
-**This project** implements an AI agent (running locally via OpenClaw + Ollama) that:
-1. Runs the enrichment pipeline to detect what is still missing.
-2. Browses DOAJ, publisher websites, Scimago, and CrossRef to find missing values.
-3. Writes structured suggestions (with sources and confidence scores) to a CSV file.
-4. Human reviewers inspect the CSV, check each suggestion, and accept/reject it.
-5. Accepted suggestions flow back into the Google Sheet, then through the pipeline.
+## Runtime Boundaries
 
-The agent **never writes directly to the Google Sheet** — all changes require human approval.
+- Python owns orchestration, gap-report loading, journal selection, deduplication, validation, and persistence.
+- OpenClaw owns journal-level browsing, source gathering, and JSON suggestion generation.
+- The current agent runtime works only on journals already present in the caller-selected gap backlog.
+- The model does not edit CSV or state files in the normal automation path.
+- `WhereToPublish.github.io/` is treated as read-only input during enrichment runs.
+- Weak, blocked, or contradictory sources become `unresolved` instead of speculative rows.
 
----
+## Key Files
 
-## Repository Layout
-
-```
-journal-metadata-enrichment/
-├── README.md                     ← this file
-├── DONE.md                       ← LLM-targeted project state description
-├── NEXT_STEPS.md                 ← How to wire Google Sheets write access + review UI
-├── run_agent.sh                  ← Single entry point — start the agent here
-│
-├── agent/
-│   ├── workspace/                ← OpenClaw agent workspace (config, skills, identity)
-│   │   ├── AGENTS.md             ← Operating rules
-│   │   ├── SOUL.md               ← Agent personality and confidence discipline
-│   │   ├── IDENTITY.md           ← Name: JournalMind
-│   │   ├── USER.md               ← User profile (Thomas Latrille)
-│   │   ├── TOOLS.md              ← Tool conventions (paths, limits, checkpointing)
-│   │   ├── BOOT.md               ← Startup checklist
-│   │   ├── HEARTBEAT.md          ← Minimal (no scheduling; manual start only)
-│   │   └── skills/
-│   │       └── journal-enrichment/
-│   │           └── SKILL.md      ← Core skill: pipeline knowledge + workflow + output format
-│   │
-│   ├── scripts/
-│   │   ├── fetch_sheet.py        ← Download a Google Sheet tab as CSV (no auth, public URL)
-│   │   └── gap_analysis.py       ← Run pipeline, identify gaps, write gap_report.json
-│   │
-│   └── output/                   ← Agent-generated files (gitignored)
-│       ├── AI_Suggestions.csv    ← Final agent output for human review
-│       ├── gap_report.json       ← Pipeline gap analysis results
-│       └── checkpoint_*.csv      ← Periodic checkpoints during long runs
-│
-├── Docs/                         ← Background reports (Report-1..3, TODO_kickstart)
-│
-├── WhereToPublish.github.io/     ← The WTP website + data pipeline (separate repo, cloned)
-│   └── scripts/
-│       ├── download_csv.sh       ← Downloads all Google Sheet tabs as CSVs
-│       ├── update_extracted.py   ← Enriches CSVs with external sources
-│       ├── data_process.py       ← Normalises, deduplicates, outputs final CSVs
-│       └── libraries.py         ← Shared utilities (norm_name, norm_url, etc.)
-│
-└── openclaw/                     ← OpenClaw source repo (cloned for reference)
-```
-
----
+- `run_agent.sh`: launcher, gateway bootstrap, live log streaming, and `.venv` preflight.
+- `requirements.txt`: Python dependencies for the repo-local virtual environment.
+- `agent/scripts/gap_analysis.py`: refreshes the WTP pipeline and writes `agent/output/gap_report.json`.
+- `agent/scripts/run_enrichment.py`: prompts OpenClaw, loops over journals, and records run state.
+- `agent/scripts/openclaw_runtime.py`: runs `openclaw agent --json` and retries invalid non-JSON replies once.
+- `agent/scripts/suggestions_io.py`: validates and persists only supported suggestion rows.
+- `agent/workspace/`: OpenClaw workspace instructions for the per-journal tool-driven workflow.
+- `WhereToPublish.github.io/`: source data and pipeline, treated as input only.
 
 ## Requirements
 
-### Software
-- **macOS** (tested on M2, 32 GB RAM)
-- **Node.js** ≥ 18 (for OpenClaw)
-- **OpenClaw** globally installed: `npm install -g openclaw`
-- **Ollama** installed and running: https://ollama.com/download
-- **Python 3.12** with `polars` (the WTP pipeline dependency)
+- macOS
+- `openclaw` in `PATH`
+- `ollama` installed and running
+- a local Ollama model available; validated default: `ollama/qwen3:8b`
+- a repo-local virtual environment at `.venv`
+- Python dependencies installed from `requirements.txt`
 
-### Recommended Python environment
+Minimum setup:
+
 ```bash
-python3 -m venv /Users/tlatrille/Documents/venv/py312stats
-source /Users/tlatrille/Documents/venv/py312stats/bin/activate
-pip install polars
+.venv/bin/pip install -r requirements.txt
+ollama serve
+ollama pull qwen3:8b
 ```
 
-### LLM model (choose one based on your hardware)
-```bash
-ollama pull qwen2.5:32b      # Recommended: best reasoning, ~19 GB on disk
-ollama pull qwen3:30b-a3b    # Alternative: MoE architecture, very fast, ~18 GB
-ollama pull gemma3:27b       # Alternative: Google Gemma 3, ~17 GB
-```
-
-Then configure OpenClaw to use the model:
-```bash
-openclaw config set agents.defaults.model.primary ollama/qwen2.5:32b
-```
-
----
+Use `JOURNALMIND_MODEL=ollama/<tag>` to override the default model for one run.
 
 ## Quickstart
 
 ```bash
-# 1. Clone required repos (if not already done)
-git clone https://github.com/WhereToPublish/WhereToPublish.github.io.git
-git clone https://github.com/openclaw/openclaw.git
-
-# 2. Start the agent
 ./run_agent.sh
-
-# 3. In the WebChat that opens, paste and send:
-#    "Start the journal enrichment task for Genetics & Genomics."
-
-# 4. The agent will:
-#    - Download the latest sheet data
-#    - Run the enrichment pipeline
-#    - Research each journal with missing metadata
-#    - Write suggestions to agent/output/AI_Suggestions.csv
-
-# 5. Review suggestions:
-cat agent/output/AI_Suggestions.csv
 ```
 
----
+The launcher:
 
-## How the Agent Works
+1. checks `openclaw`, `ollama`, the selected model, and `.venv/bin/python`
+2. checks that `.venv/bin/python` can import `polars`
+3. configures the OpenClaw workspace and model
+4. restarts the gateway and starts `openclaw logs --follow --json`
+5. runs `agent/scripts/run_enrichment.py` with `--priorities high,medium --max-suggestions 50`
 
-```
-run_agent.sh
-    │
-    ├─ configures OpenClaw workspace → agent/workspace/
-    ├─ starts OpenClaw gateway
-    └─ opens WebChat at localhost:18789
+Live monitoring is via terminal output and the log files under `agent/output/logs/`.
 
-WebChat (user sends task message)
-    │
-    JournalMind agent (powered by local LLM via Ollama):
-    │
-    ├─ Step 1: runs gap_analysis.py
-    │          ├─ downloads Genetics & Genomics CSV (public Google Sheets export)
-    │          ├─ downloads Scimago, DOAJ, OpenAPC, Dataverse (if not cached)
-    │          ├─ runs update_extracted.py + data_process.py
-    │          └─ produces gap_report.json (per-journal list of missing fields)
-    │
-    ├─ Step 2: reads gap_report.json
-    │          → sorted list of journals, HIGH-priority gaps first
-    │
-    └─ Step 3: for each journal with gaps:
-               ├─ searches DOAJ for OA status, publisher, APCs
-               ├─ visits official publisher page
-               ├─ checks Scimago for the journal's exact title (critical for pipeline joins)
-               └─ writes suggestions to AI_Suggestions.csv with:
-                  - exact column to update
-                  - suggested value
-                  - confidence score (0–1)
-                  - source URLs
-                  - reasoning
-```
-
----
-
-## Output: AI_Suggestions.csv
-
-The agent writes one row per suggestion. Columns:
-
-| Column | Description |
-|--------|-------------|
-| `journal` | Exact journal name (matches Google Sheet) |
-| `field` | Column to update (e.g. "Business model", "Scimago Journal Title") |
-| `current_value` | Current value in the sheet (empty if null) |
-| `suggested_value` | Proposed new value |
-| `confidence` | Float 0.0–1.0 (≥ 0.85 = high confidence) |
-| `source_urls` | Pipe-separated URLs of pages visited |
-| `reasoning` | 1–2 sentence explanation of the evidence |
-| `suggestion_type` | `fill` / `alt_name` / `correct` / `add` / `remove` |
-| `priority` | `high` / `medium` / `low` |
-
-**`suggestion_type` meanings:**
-- `fill` — adding a value to an empty field
-- `alt_name` — providing the `Scimago Journal Title` that fixes a failed pipeline join
-- `correct` — correcting an existing wrong value
-- `add` — adding a new journal row (missing from database)
-- `remove` — flagging a non-existent journal for removal
-
----
-
-## Uploading to Google Sheets & Review
-
-See [NEXT_STEPS.md](NEXT_STEPS.md) for full instructions on:
-1. Creating a Google Cloud service account and enabling the Sheets API.
-2. Running `upload_suggestions.py` to push the CSV to the `AI_Suggestions` tab.
-3. Installing the Google Apps Script that lets team members check/uncheck suggestions and apply them with one click.
-
----
-
-## Known Limitations
-
-- **Model hallucinations**: The LLM may misread a web page or infer an incorrect value.
-  All suggestions require human review before entering the database.
-- **Anti-bot measures**: Some publisher websites (Nature, ScienceDirect) use aggressive
-  bot detection. The browser tool may fail on these; the agent will skip them.
-- **Name-only matching**: The pipeline matches journals by name (no ISSN). Finding the
-  correct `Scimago Journal Title` is the highest-value action for many journals.
-- **Context window**: Very long browsing sessions may approach the model's context limit.
-  The agent checkpoints every 10 journals to limit data loss.
-- **Memory usage**: Running a 27B+ model + browser sessions on a 32 GB machine will use
-  ~25–30 GB RAM. Close other heavy applications before starting an overnight run.
-
----
-
-## Running gap_analysis.py Standalone
-
-You can run the gap analysis independently to inspect current data quality:
+## Useful Examples
 
 ```bash
-source /Users/tlatrille/Documents/venv/py312stats/bin/activate
-python3 agent/scripts/gap_analysis.py
+# Reuse the current gap report and process one named journal
+./run_agent.sh --skip-gap-analysis --journal "Human Genomics"
 
-# Skip downloads if you already have fresh data:
-python3 agent/scripts/gap_analysis.py --skip-download
+# Run the full pipeline refresh, then process one journal
+./run_agent.sh --journal "Plant Genetic Resources"
 
-# Skip pipeline run too (use existing output files):
-python3 agent/scripts/gap_analysis.py --skip-download --skip-pipeline
+# Process only the first three eligible journals
+./run_agent.sh --journal-limit 3
 
-# View the report:
-python3 -m json.tool agent/output/gap_report.json | head -60
+# Override the model for one run
+JOURNALMIND_MODEL=ollama/qwen2.5:14b ./run_agent.sh --journal-limit 1
 ```
 
----
+All extra arguments are forwarded to `agent/scripts/run_enrichment.py`.
 
-## Stopping the Agent
+## Validation Rules
+
+Only requested fields are eligible for persistence. The validator rejects rows that are structurally valid JSON but still unsupported, including:
+
+- publisher-as-institution guesses
+- institution types without a valid institution value
+- `Scimago Journal Title` suggestions that are not true `alt_name` rows
+- `Scimago Journal Title` values that normalize to the original journal name
+- `APC Euros = 0` rows unless the reasoning explicitly states there is no APC
+
+If no suggestion survives validation, the journal is written as `unresolved`.
+
+## Outputs
+
+Default result files:
+
+- `agent/output/AI_Suggestions.csv`
+- `agent/output/gap_report.json`
+- `agent/output/state/run_state.json`
+
+Run-level logs:
+
+- `agent/output/logs/run-*.console.log`
+- `agent/output/logs/run-*.openclaw.jsonl`
+- `agent/output/logs/run-*.runner.log`
+
+Per-journal artifacts:
+
+- `agent/output/logs/enrichment-*.prompt.txt`
+- `agent/output/logs/enrichment-*.stdout.json`
+- `agent/output/logs/enrichment-*.stderr.log`
+
+Checkpoint files:
+
+- `agent/output/state/checkpoint_suggestions_*.csv`
+
+## Current Runtime Behavior
+
+The current implementation has been verified with real, non-dry runs.
+
+- the full launcher refreshes `agent/output/gap_report.json` and now records `wtp_dir` as `WhereToPublish.github.io`
+- the agent stays within the existing gap backlog and does not propose adding new journals
+- blocked-source cases such as `Human Genomics` stay unresolved with no persisted rows
+- supported cases can persist a narrow subset of requested fields, for example `Business model = Hybrid` for `Plant Genetic Resources`
+
+Known runtime limitation:
+
+- the current OpenClaw environment may not have a working `web_search` backend, so the prompt provides direct official-site, DOAJ, and Scimago lookup URLs and falls back to `unresolved` when those sources are blocked or insufficient
+
+## Stop / Reset
 
 ```bash
 openclaw gateway stop
-```
-
-To restore your previous OpenClaw workspace (if you had one):
-```bash
 openclaw config unset agents.defaults.workspace
 ```

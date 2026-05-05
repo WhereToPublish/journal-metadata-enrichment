@@ -6,10 +6,8 @@ credentials*.json
 # Agent-generated outputs — not versioned
 agent/output/*.csv
 agent/output/*.json
-workspace/state/gaps.json
-workspace/state/suggestions.json
-workspace/state/last-run-summary.md
-workspace/state/checkpoint.json
+agent/output/logs/
+agent/output/state/
 
 # Python
 __pycache__/

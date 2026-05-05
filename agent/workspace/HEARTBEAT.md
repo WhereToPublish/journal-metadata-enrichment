@@ -1,4 +1,5 @@
 # Heartbeat
 
-This agent is NOT scheduled. It runs only when manually started via run_agent.sh.
-There is no heartbeat task. This file exists to satisfy the OpenClaw workspace bootstrap.
+This agent is not scheduled.
+One session equals one journal.
+The caller creates a fresh session for the next journal, so there is no model-managed heartbeat or checkpoint loop.
