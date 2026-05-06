@@ -8,7 +8,7 @@ The current runtime is built around one journal per OpenClaw session.
 
 1. `run_agent.sh` is the only entry point.
 2. The launcher uses the repo-local `.venv/bin/python`, checks that `polars` is importable, configures the OpenClaw workspace, and starts live logs.
-3. `agent/scripts/gap_analysis.py` downloads the Genetics & Genomics sheet via the Google Sheets API, refreshes the WhereToPublish pipeline, and writes `agent/output/gap_report.json` unless `--skip-gap-analysis` is passed.
+3. `agent/scripts/gap_analysis.py` verifies that required external data files exist in the WhereToPublish project, downloads the Genetics & Genomics sheet via the Google Sheets API, refreshes the WhereToPublish pipeline, and writes `agent/output/gap_report.json` unless `--skip-gap-analysis` is passed.
 4. `agent/scripts/run_enrichment.py` selects journals from the gap report and opens one fresh OpenClaw session per journal.
 5. OpenClaw does the journal-level research with tools and returns one JSON object.
 6. Python validates that JSON and writes only accepted rows to `agent/output/AI_Suggestions.csv` plus run state and logs.
@@ -31,7 +31,7 @@ The system never writes directly to the data tabs of the Google Sheet. Persisted
 - `run_agent.sh`: launcher, gateway bootstrap, live log streaming, and `.venv` preflight.
 - `requirements.txt`: Python dependencies for the repo-local virtual environment.
 - `agent/scripts/sheets_client.py`: shared Google Sheets API module (auth, download, upload helpers).
-- `agent/scripts/gap_analysis.py`: downloads the Genetics & Genomics sheet via API, refreshes the WTP pipeline, and writes `agent/output/gap_report.json`.
+- `agent/scripts/gap_analysis.py`: verifies required external data files are present in `WhereToPublish.github.io/data_extraction/` (fails fast with a clear error if any are missing), downloads the Genetics & Genomics sheet via the Sheets API, refreshes the WTP pipeline, and writes `agent/output/gap_report.json`.
 - `agent/scripts/run_enrichment.py`: prompts OpenClaw, loops over journals, and records run state.
 - `agent/scripts/openclaw_runtime.py`: runs `openclaw agent --json` and retries invalid non-JSON replies once.
 - `agent/scripts/suggestions_io.py`: validates and persists only supported suggestion rows.
@@ -49,6 +49,7 @@ The system never writes directly to the data tabs of the Google Sheet. Persisted
 - a repo-local virtual environment at `.venv`
 - Python dependencies installed from `requirements.txt`
 - a Google service-account JSON key with read/write access to the spreadsheet, placed at `~/.config/wheretopublish/google_service_account.json` or pointed to by `GOOGLE_SERVICE_ACCOUNT_KEY`
+- external data files present in `WhereToPublish.github.io/data_extraction/` — run `bash scripts/download_extraction.sh` from inside that repo to populate them
 
 Minimum setup:
 
@@ -167,7 +168,8 @@ Checkpoint files:
 
 The current implementation has been verified with real, non-dry runs.
 
-- the full launcher refreshes `agent/output/gap_report.json` and now records `wtp_dir` as `WhereToPublish.github.io`
+- the full launcher verifies external data files then refreshes `agent/output/gap_report.json` and records `wtp_dir` as `WhereToPublish.github.io`
+- if any required extraction file is missing, gap analysis exits immediately with an actionable error listing the missing files and the command to populate them
 - the agent stays within the existing gap backlog and does not propose adding new journals
 - blocked-source cases such as `Human Genomics` stay unresolved with no persisted rows
 - supported cases can persist a narrow subset of requested fields, for example `Business model = Hybrid` for `Plant Genetic Resources`

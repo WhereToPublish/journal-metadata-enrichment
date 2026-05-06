@@ -9,8 +9,8 @@ The current end-to-end flow is:
 ```text
 run_agent.sh
   -> agent/scripts/gap_analysis.py (unless skipped)
+    -> verifies external data files exist in WhereToPublish.github.io/data_extraction/
     -> Google Sheets API (sheets_client.py) — downloads Genetics & Genomics tab
-    -> external data sources (OpenAPC, DOAJ, Scimago, PCI, Dataverse)
     -> WhereToPublish pipeline (update_extracted.py → data_process.py)
   -> agent/scripts/run_enrichment.py
     -> agent/scripts/openclaw_runtime.py
@@ -96,7 +96,7 @@ Upload script for staging suggestions in the Google Sheet.
 - prepends an `Approve?` checkbox column (initially `FALSE`) for human review
 - accepts optional `--input` and `--credentials` arguments
 
-
+### agent/scripts/enrichment_common.py
 
 Shared constants and schemas.
 
@@ -109,11 +109,13 @@ Shared constants and schemas.
 
 Pipeline refresh and gap discovery.
 
+- verifies that all 5 required external data files are present in `WhereToPublish.github.io/data_extraction/` (openapc.csv.gz, DOAJ.csv.gz, scimagojr.csv.gz, PCI_friendly.csv.gz, APC_dataverse.txt.gz); exits immediately with a clear, actionable error listing missing files if any are absent
+- does not download external data; those files are owned by the WhereToPublish project and populated via `bash scripts/download_extraction.sh` from inside that repo
 - downloads the Genetics & Genomics sheet via the Google Sheets API (using `sheets_client`)
-- downloads external-source inputs (OpenAPC, DOAJ, Scimago, PCI, Dataverse)
-- runs the WTP pipeline unless skipped
+- runs the WTP pipeline (update_extracted.py → data_process.py) unless skipped
 - writes `agent/output/gap_report.json`
 - records `wtp_dir` as `WhereToPublish.github.io` when run from the repo root
+- `--skip-download` skips only the Google Sheet download (external data verification always runs)
 - accepts optional `--credentials` argument forwarded to the Sheets API call
 
 ### agent/scripts/run_enrichment.py
@@ -153,10 +155,6 @@ Persistence and sanitization layer.
 - rejects `APC Euros = 0` unless the reasoning explicitly states there is no APC
 - writes `run_state.json` and checkpoint CSVs
 - converts `status=ok` with zero valid rows into `unresolved`
-
-### agent/scripts/fetch_sheet.py
-
-Standalone utility for downloading any spreadsheet tab via the Sheets API. Uses `sheets_client` for authentication; accepts `--field`, `--output`, and `--credentials`. Not used in the main launcher path.
 
 ## Removed Python Surface
 
@@ -226,7 +224,8 @@ The implementation has been validated with real launcher runs.
 
 Validated behavior:
 
-- the full launcher refreshes the gap report and downloads the Genetics & Genomics sheet via the Sheets API
+- the full launcher verifies external data files then refreshes the gap report, downloading the Genetics & Genomics sheet via the Sheets API
+- if any required external data file is missing, gap analysis exits immediately listing missing files and the command to fix it
 - `fetch_sheet.py` downloads any tab by field slug using the Sheets API
 - `upload_suggestions.py` clears and rewrites the `AI_suggestions` spreadsheet tab with current suggestions and an `Approve?` checkbox column
 - blocked-source cases such as `Human Genomics` stay unresolved with no persisted rows

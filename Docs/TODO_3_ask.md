@@ -1,0 +1,6 @@
+I am a bioinformatician with good knowledge on programming (mainly c++ and python), and I already have developed a web serveur (with Ruby on Rails, both the front and back-end) and a few static websites.
+This is about the project WhereToPublish (https://github.com/WhereToPublish/WhereToPublish.github.io), and building an AI agent that will be able to automatically complete and update the raw data.
+
+Understand and analyze in depth the project at https://github.com/WhereToPublish/journal-metadata-enrichment
+This is an attempt at implementing AI agent that will be able to automatically complete and update the raw data.
+Most importantly, read and analyze all the Markdown files in the folder agent/workspace that contains the OpenClaw workspace instructions for the per-journal tool-driven workflow, and analyze in depth the implementation of the AI agent, its strenghts and limitations, and suggest ways to improve it. Search deep, read publications on the topic if necessary, and summaries your research with a discussion of the different strategies that could be implemented to improve the performance of the AI agent for this task.
