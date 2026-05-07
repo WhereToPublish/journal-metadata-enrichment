@@ -45,11 +45,6 @@ ALLOWED_SUGGESTION_TYPES = {"fill", "alt_name", "correct", "remove"}
 ALLOWED_BUSINESS_MODELS = {"OA diamond", "OA", "Hybrid", "Subscription"}
 
 DEFAULT_MODEL = "ollama/qwen3:8b"
-DEFAULT_PRIORITIES = ("high", "medium", "low")
-
-DOAJ_DATASET_URL = "https://doaj.org/csv"
-OPENAPC_DATASET_URL = "https://github.com/OpenAPC/openapc-de/raw/refs/heads/master/data/apc_de.csv"
-DATAVERSE_DATASET_URL = "https://doi.org/10.7910/DVN/CR1MMV"
 
 
 def slugify(value: str) -> str:

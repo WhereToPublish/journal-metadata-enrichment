@@ -48,7 +48,7 @@ There is a few things to consider that are not clear in the reports, that I want
 In this session, we will do the following:
 
 - Implement this project, do as much as you can, you have enough information so that it can reach the state of producing a file that contains the suggested edit. You don't have the right to upload to the Google Sheet yet, but you should code the Agent that will be able to produce the file uploaded to the Google Sheet.
-- Give the instruction (into the file NEXT_STEPS.md) of want I should do so that the Agent is able to upload to the Google Sheet, and what script should run on the Google sheet so that user only click accept/reject and the script will update the database
+- Give the instruction (into the file GOOGLE_APP_SCRIPT.md) of want I should do so that the Agent is able to upload to the Google Sheet, and what script should run on the Google sheet so that user only click accept/reject and the script will update the database
 - Fill in all the .md files necesssary for OpenClaw (AGENTS.md, HEARTBEAT.md, IDENTITY.md, SOUL.md, TOOLS.md, USER.md, SKILL.md, and other files I have missed)
 - Test the agent and fix errors, do not stop until the agent is producing the output file containing suggestions.
 

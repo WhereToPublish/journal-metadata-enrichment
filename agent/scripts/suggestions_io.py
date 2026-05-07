@@ -129,6 +129,7 @@ def sanitize_agent_result(
     gap_lookup = {gap["field"]: gap for gap in journal_gap["gaps"]}
     allowed_fields = set(gap_lookup)
     current_publisher = str(journal_gap.get("current_publisher", "")).strip()
+    current_business_model = str(journal_gap.get("current_business_model", "")).strip()
     current_institution = str(gap_lookup.get("Institution", {}).get("current_value", "")).strip()
     allowed_institution_types = {"Society", "Society/Association", "University", "Research Institute"}
     candidate_rows: list[dict[str, str]] = []
@@ -199,6 +200,9 @@ def sanitize_agent_result(
                 continue
 
         if field == "APC Euros" and suggested_value == "0":
+            # Never accept APC=0 for subscription journals — it implies OA diamond in this schema
+            if current_business_model == "Subscription":
+                continue
             if not any(
                 marker in reasoning_lower
                 for marker in (
@@ -209,6 +213,12 @@ def sanitize_agent_result(
                     "apc is 0",
                     "free to publish",
                     "no publication fee",
+                    "no charge",
+                    "does not charge",
+                    "without apc",
+                    "no article fee",
+                    "not charged",
+                    "waived",
                 )
             ):
                 continue

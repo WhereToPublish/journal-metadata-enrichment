@@ -10,7 +10,7 @@ The current end-to-end flow is:
 run_agent.sh
   -> agent/scripts/gap_analysis.py (unless skipped)
     -> verifies external data files exist in WhereToPublish.github.io/data_extraction/
-    -> Google Sheets API (sheets_client.py) — downloads Genetics & Genomics tab
+    -> Google Sheets API (sheets_client.py) — downloads all 10 sheet tabs
     -> WhereToPublish pipeline (update_extracted.py → data_process.py)
   -> agent/scripts/run_enrichment.py
     -> agent/scripts/openclaw_runtime.py
@@ -37,7 +37,7 @@ Key runtime properties:
 
 - `README.md`: human-facing overview of the current runtime
 - `DONE.md`: this file
-- `NEXT_STEPS.md`: future work only
+- `GOOGLE_APP_SCRIPT.md`: future work only
 - `run_agent.sh`: launcher used for real runs
 - `requirements.txt`: Python dependencies for `.venv`
 - `.gitignore`: ignores generated output under `agent/output/`
@@ -54,8 +54,8 @@ Key runtime properties:
 - sets `agents.defaults.workspace` to `agent/workspace`
 - sets `agents.defaults.model.primary` to the selected model
 - restarts or starts the OpenClaw gateway
-- starts `openclaw logs --follow --json` and tees it into live terminal output plus log files
-- launches `agent/scripts/run_enrichment.py`
+- starts `openclaw logs --follow --json` and redirects its raw JSONL output directly to `agent/output/logs/run-<RUN_ID>.openclaw.jsonl` (no filtering)
+- launches `agent/scripts/run_enrichment.py` forwarding all extra arguments
 - reports the effective output, state, and log paths at the end of the run
 - cleans up the background OpenClaw log tail on exit
 
@@ -63,7 +63,7 @@ Current model behavior:
 
 - default model: `ollama/qwen3:8b`
 - override mechanism: `JOURNALMIND_MODEL=ollama/<tag>`
-- default runner arguments: `--priorities high,medium --max-suggestions 50`
+- all journals across all 10 tabs are processed, sorted by priority (high → medium → low); stops when `--max-suggestions` valid suggestions are written (default: 15)
 - extra launcher arguments are forwarded directly to `run_enrichment.py`
 
 ## Python Modules
@@ -107,15 +107,16 @@ Shared constants and schemas.
 
 ### agent/scripts/gap_analysis.py
 
-Pipeline refresh and gap discovery.
+Pipeline refresh and gap discovery across all Google Sheets tabs.
 
 - verifies that all 5 required external data files are present in `WhereToPublish.github.io/data_extraction/` (openapc.csv.gz, DOAJ.csv.gz, scimagojr.csv.gz, PCI_friendly.csv.gz, APC_dataverse.txt.gz); exits immediately with a clear, actionable error listing missing files if any are absent
 - does not download external data; those files are owned by the WhereToPublish project and populated via `bash scripts/download_extraction.sh` from inside that repo
-- downloads the Genetics & Genomics sheet via the Google Sheets API (using `sheets_client`)
+- downloads **all 10 Google Sheets tabs** (Generalists, Anatomy & Physiology, Cancer, Development, Ecology & Evolution, Genetics & Genomics, Immunology, Molecular & Cellular Biology, Neurosciences, Plants) via the Sheets API (using `sheets_client`) and writes each to `data_extracted/<slug>.csv`
 - runs the WTP pipeline (update_extracted.py → data_process.py) unless skipped
+- builds a unified gap report covering all tabs: each journal entry includes a `tab` field indicating its source; journals appearing in multiple tabs are deduplicated by name (first-seen tab wins)
 - writes `agent/output/gap_report.json`
 - records `wtp_dir` as `WhereToPublish.github.io` when run from the repo root
-- `--skip-download` skips only the Google Sheet download (external data verification always runs)
+- `--skip-download` skips all sheet tab downloads (external data verification always runs)
 - accepts optional `--credentials` argument forwarded to the Sheets API call
 
 ### agent/scripts/run_enrichment.py
@@ -152,7 +153,8 @@ Persistence and sanitization layer.
 - rejects institution types without a valid institution value
 - rejects `Scimago Journal Title` rows unless they are true `alt_name` suggestions
 - rejects `Scimago Journal Title` values that normalize to the original journal name
-- rejects `APC Euros = 0` unless the reasoning explicitly states there is no APC
+- rejects `APC Euros = 0` for journals whose known business model is `Subscription` (a Subscription journal never has a zero APC in this schema; that value implies OA diamond)
+- rejects `APC Euros = 0` for any other journal unless the reasoning explicitly states there is no APC (e.g. "no APC", "free to publish", "does not charge")
 - writes `run_state.json` and checkpoint CSVs
 - converts `status=ok` with zero valid rows into `unresolved`
 
@@ -208,9 +210,8 @@ Checkpoint files:
 
 Run-level logs:
 
-- `agent/output/logs/run-*.console.log`
-- `agent/output/logs/run-*.openclaw.jsonl`
-- `agent/output/logs/run-*.runner.log`
+- `agent/output/logs/run-*.openclaw.jsonl` — raw archived OpenClaw JSON log stream
+- `agent/output/logs/run-*.runner.log` — clean orchestrator output
 
 Per-journal artifacts:
 
@@ -224,13 +225,19 @@ The implementation has been validated with real launcher runs.
 
 Validated behavior:
 
-- the full launcher verifies external data files then refreshes the gap report, downloading the Genetics & Genomics sheet via the Sheets API
+- the full launcher verifies external data files then downloads all 10 Google Sheets tabs and refreshes the gap report across all tabs
 - if any required external data file is missing, gap analysis exits immediately listing missing files and the command to fix it
-- `fetch_sheet.py` downloads any tab by field slug using the Sheets API
+- `fetch_sheet.py` downloads any single tab by field slug using the Sheets API
 - `upload_suggestions.py` clears and rewrites the `AI_suggestions` spreadsheet tab with current suggestions and an `Approve?` checkbox column
-- blocked-source cases such as `Human Genomics` stay unresolved with no persisted rows
-- supported cases can persist a narrow subset of requested fields, for example `Business model = Hybrid` for `Plant Genetic Resources`
+- the gap report covers all 10 biology field tabs (~2400 journals); each journal entry includes a `tab` field; journals in multiple tabs are deduplicated by name
+- blocked-source cases stay unresolved with no persisted rows
 - when the model returns structurally valid but unsupported guesses, the validator drops them instead of writing them
+- `Scimago Journal Title` suggestions where the suggested value normalizes to the same name as the journal are correctly dropped
+- `APC Euros = 0` is accepted only when the reasoning contains an explicit no-APC marker; it is always rejected for Subscription journals regardless of reasoning
+- the model correctly returns `suggestion_type: alt_name` for `Scimago Journal Title` fields
+- when the model returns prose instead of JSON, the retry prompt includes a concrete unresolved JSON example and the model recovers
+- suggestions with empty `suggested_value` are dropped before persistence
+- the OpenClaw live log filter eliminates WebSocket heartbeat floods; typical run produces a `run-*.openclaw.jsonl` of ~600KB instead of 3–4MB
 
 Known runtime constraint:
 

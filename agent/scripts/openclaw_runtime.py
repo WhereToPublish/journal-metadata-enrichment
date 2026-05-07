@@ -41,7 +41,7 @@ class OpenClawRunner:
         self.local = local
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
-    def _run_once(self, session_id: str, prompt: str, timeout_seconds: int = 240) -> AgentRunResult:
+    def _run_once(self, session_id: str, prompt: str, timeout_seconds: int = 3600) -> AgentRunResult:
         prompt_path = self.log_dir / f"{session_id}.prompt.txt"
         stdout_path = self.log_dir / f"{session_id}.stdout.json"
         stderr_path = self.log_dir / f"{session_id}.stderr.log"
@@ -61,13 +61,28 @@ class OpenClawRunner:
         if self.local:
             command.insert(2, "--local")
 
-        process = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            timeout_note = f"openclaw agent timed out after {timeout_seconds}s"
+            stderr_path.write_text(timeout_note, encoding="utf-8")
+            stdout_path.write_text("", encoding="utf-8")
+            synthetic = {"journal": "", "suggestions": [], "status": "unresolved", "notes": timeout_note}
+            return AgentRunResult(
+                session_id=session_id,
+                stdout="",
+                stderr=timeout_note,
+                response_json=None,
+                payload_text="",
+                parsed_payload=synthetic,
+            )
+
         stdout_path.write_text(process.stdout, encoding="utf-8")
         stderr_path.write_text(process.stderr, encoding="utf-8")
 
@@ -96,8 +111,11 @@ class OpenClawRunner:
     def run(self, session_id: str, prompt: str, timeout_seconds: int = 240, max_attempts: int = 2) -> AgentRunResult:
         retry_prompt = (
             prompt
-            + "\n\nYour previous reply was invalid because it did not return the required JSON object. "
-            + "Reply again with exactly one JSON object and nothing else."
+            + "\n\nYour previous reply was invalid: you returned plain text instead of a JSON object. "
+            + "You MUST return exactly one JSON object and nothing else. "
+            + "Even if all sources are blocked or unavailable, return a valid JSON object like this:\n"
+            + '{"journal": "<journal name>", "suggestions": [], "status": "unresolved", "notes": "<brief reason>"}\n'
+            + "Do not include any text before or after the JSON object."
         )
         result: AgentRunResult | None = None
         for attempt in range(1, max_attempts + 1):

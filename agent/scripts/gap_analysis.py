@@ -2,10 +2,10 @@
 
 This script:
 1. Verifies that required external data files are present in the WhereToPublish project.
-2. Downloads the Genetics & Genomics sheet from Google Sheets (via the Sheets API).
+2. Downloads all Google Sheets tabs (every field slug in SHEET_TAB_NAMES) via the Sheets API.
 3. Runs update_extracted.py then data_process.py (the existing WTP pipeline).
-4. Reads the post-enrichment data/genetics_genomics.csv.
-5. Compares raw vs. enriched data to identify what is still missing.
+4. Reads the post-enrichment data/<slug>.csv for every tab.
+5. Compares raw vs. enriched data across all tabs to identify what is still missing.
 6. Produces agent/output/gap_report.json with per-journal gaps, priorities, and a summary.
 
 The external data files (Scimago, DOAJ, OpenAPC, PCI, Dataverse) must already be present
@@ -95,24 +95,26 @@ def verify_extraction_data(wtp_dir: Path) -> None:
     log(f"  Extraction data: all {len(REQUIRED_EXTRACTION_FILES)} required files present")
 
 
-def download_genetics_genomics_csv(wtp_dir: Path, credentials_path: Path | None = None) -> None:
-    """Download the Genetics & Genomics sheet to data_extracted/genetics_genomics.csv."""
+def download_all_sheets_csvs(wtp_dir: Path, credentials_path: Path | None = None) -> None:
+    """Download every sheet tab to data_extracted/<slug>.csv."""
     data_extracted = wtp_dir / "data_extracted"
     data_extracted.mkdir(parents=True, exist_ok=True)
-    dest = data_extracted / "genetics_genomics.csv"
 
-    log("Downloading Genetics & Genomics sheet via Sheets API ...")
+    log("Downloading all Google Sheets tabs via Sheets API ...")
     try:
         service = _sheets_client.get_sheets_service(credentials_path=credentials_path, readonly=True)
-        rows = _sheets_client.download_tab_as_csv(
-            service,
-            _sheets_client.SHEET_TAB_NAMES["genetics_genomics"],
-            dest,
-        )
-        log(f"  Genetics & Genomics: {len(rows)} rows downloaded")
     except Exception as exc:
-        log(f"ERROR: Could not download Genetics & Genomics sheet: {exc}")
+        log(f"ERROR: Could not authenticate with the Sheets API: {exc}")
         sys.exit(1)
+
+    for slug, tab_name in _sheets_client.SHEET_TAB_NAMES.items():
+        dest = data_extracted / f"{slug}.csv"
+        try:
+            rows = _sheets_client.download_tab_as_csv(service, tab_name, dest)
+            log(f"  {tab_name}: {len(rows)} rows downloaded")
+        except Exception as exc:
+            log(f"ERROR: Could not download tab '{tab_name}': {exc}")
+            sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -194,20 +196,26 @@ def compute_gaps(raw_row: dict, enriched_row: dict | None) -> list[dict]:
     return gaps
 
 
-def build_gap_report(wtp_dir: Path) -> dict:
-    """Compare raw Google Sheets data with enriched pipeline output and build gap report."""
-    raw_path = wtp_dir / "data_extracted" / "genetics_genomics.csv"
-    enriched_path = wtp_dir / "data" / "genetics_genomics.csv"
+def _process_tab(slug: str, wtp_dir: Path) -> tuple[list[dict], list[str]]:
+    """Load raw + enriched CSVs for one tab and return (journal entries with gaps, warnings).
+
+    Returns a list of journal gap dicts (ready for the report) and a list of warning strings
+    for any issue that should be logged but does not abort processing.
+    """
+    warnings: list[str] = []
+    raw_path = wtp_dir / "data_extracted" / f"{slug}.csv"
+    enriched_path = wtp_dir / "data" / f"{slug}.csv"
 
     if not raw_path.exists():
-        log(f"ERROR: Raw CSV not found: {display_path(raw_path)}")
-        sys.exit(1)
+        warnings.append(f"Raw CSV not found, skipping tab '{slug}': {display_path(raw_path)}")
+        return [], warnings
     if not enriched_path.exists():
-        log(f"ERROR: Enriched CSV not found: {display_path(enriched_path)}")
-        sys.exit(1)
+        warnings.append(f"Enriched CSV not found, skipping tab '{slug}': {display_path(enriched_path)}")
+        return [], warnings
 
     raw_rows = load_csv_as_dicts(raw_path)
     enriched_rows = load_csv_as_dicts(enriched_path)
+    tab_name = _sheets_client.SHEET_TAB_NAMES.get(slug, slug)
 
     enriched_by_name: dict[str, dict] = {
         row.get("Journal", "").strip().lower(): row
@@ -215,10 +223,7 @@ def build_gap_report(wtp_dir: Path) -> dict:
         if row.get("Journal", "").strip()
     }
 
-    journals_with_gaps: list[dict] = []
-    total_gaps = 0
-    priority_counts: dict[str, int] = {"high": 0, "medium": 0, "low": 0}
-
+    entries: list[dict] = []
     for raw_row in raw_rows:
         journal_name = raw_row.get("Journal", "").strip()
         if not journal_name:
@@ -233,17 +238,50 @@ def build_gap_report(wtp_dir: Path) -> dict:
         for gap in gaps:
             gap.pop("priority_weight", None)
 
-        total_gaps += len(gaps)
-        for gap in gaps:
-            priority_counts[gap["priority"]] = priority_counts.get(gap["priority"], 0) + 1
-
-        journals_with_gaps.append({
+        entries.append({
             "name": journal_name,
+            "tab": tab_name,
             "website": enriched_row.get("Website", "") if enriched_row else raw_row.get("Website", ""),
             "current_publisher": enriched_row.get("Publisher", "") if enriched_row else "",
             "current_business_model": enriched_row.get("Business model", "") if enriched_row else "",
             "gaps": gaps,
         })
+
+    return entries, warnings
+
+
+def build_gap_report(wtp_dir: Path) -> dict:
+    """Compare raw Google Sheets data with enriched pipeline output across all tabs."""
+    # Accumulate results; deduplicate journals by name (first occurrence wins).
+    seen_names: set[str] = set()
+    journals_with_gaps: list[dict] = []
+    total_journals_seen = 0
+    total_gaps = 0
+    priority_counts: dict[str, int] = {"high": 0, "medium": 0, "low": 0}
+    tabs_processed: list[str] = []
+
+    for slug in _sheets_client.SHEET_TAB_NAMES:
+        entries, warnings = _process_tab(slug, wtp_dir)
+        for w in warnings:
+            log(f"  WARNING: {w}")
+        if not warnings:
+            tabs_processed.append(_sheets_client.SHEET_TAB_NAMES[slug])
+
+        # Count raw rows for total_journals (load directly here to stay accurate even if no gaps).
+        raw_path = wtp_dir / "data_extracted" / f"{slug}.csv"
+        if raw_path.exists():
+            raw_rows = load_csv_as_dicts(raw_path)
+            total_journals_seen += sum(1 for r in raw_rows if r.get("Journal", "").strip())
+
+        for entry in entries:
+            key = entry["name"].lower()
+            if key in seen_names:
+                continue  # deduplicate: same journal in multiple tabs → keep first occurrence
+            seen_names.add(key)
+            journals_with_gaps.append(entry)
+            total_gaps += len(entry["gaps"])
+            for gap in entry["gaps"]:
+                priority_counts[gap["priority"]] = priority_counts.get(gap["priority"], 0) + 1
 
     journals_with_gaps.sort(key=lambda j: (
         0 if any(g["priority"] == "high" for g in j["gaps"])
@@ -262,8 +300,8 @@ def build_gap_report(wtp_dir: Path) -> dict:
     return {
         "run_date": date.today().isoformat(),
         "wtp_dir": display_path(wtp_dir),
-        "tab": "Genetics & Genomics",
-        "total_journals": len(raw_rows),
+        "tabs": tabs_processed,
+        "total_journals": total_journals_seen,
         "journals_with_gaps": len(journals_with_gaps),
         "total_gap_instances": total_gaps,
         "priority_summary": priority_counts,
@@ -287,7 +325,7 @@ def main() -> None:
     parser.add_argument(
         "--skip-download",
         action="store_true",
-        help="Skip downloading the Genetics & Genomics sheet (use existing data_extracted/genetics_genomics.csv).",
+        help="Skip downloading all sheet tabs (use existing data_extracted/<slug>.csv files).",
     )
     parser.add_argument(
         "--skip-pipeline",
@@ -325,9 +363,9 @@ def main() -> None:
     verify_extraction_data(wtp_dir)
 
     if not args.skip_download:
-        download_genetics_genomics_csv(wtp_dir, credentials_path=args.credentials)
+        download_all_sheets_csvs(wtp_dir, credentials_path=args.credentials)
     else:
-        log("Skipping sheet download (--skip-download set)")
+        log("Skipping sheet downloads (--skip-download set)")
 
     if not args.skip_pipeline:
         run_pipeline(wtp_dir)
@@ -342,6 +380,7 @@ def main() -> None:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
     log(f"=== Gap Report Written: {display_path(args.output)} ===")
+    log(f"  Tabs processed      : {len(report['tabs'])}")
     log(f"  Total journals      : {report['total_journals']}")
     log(f"  Journals with gaps  : {report['journals_with_gaps']}")
     log(f"  Total gap instances : {report['total_gap_instances']}")

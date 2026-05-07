@@ -7,10 +7,11 @@ In this session, we will work on the following task:
 * The script run_agent.sh should should trigger the whole pipeline, I should not have to copy-paste the command.
 * In fact, remove the Webchat altogether, I should be able to monitor what the AI agent is doing while it is doing it, and I want to have the full log.
 * So far the AI agent does not work, it does not produce the list of suggestions. Investigate and fix what is happenning.
+* Update the script so that the gap_report is made across all google sheets, not only Genetics & Genomics. Then the rest of AI agent pipeline does not change as the gaps are processed by priority.
 
 Also, because of the context size of the LLM, it is best if the journal are processed one after the over, and that there is a reset of context between each journal. We should trigger one OpenClaw session per journal, that does the following:
 
-* The .md files necesssary for OpenClaw (AGENTS.md, HEARTBEAT.md, IDENTITY.md, SOUL.md, TOOLS.md, USER.md, SKILL.md, ...) are not adapted for this per journal processing, adapt them.
+* The .md files necessary for OpenClaw (AGENTS.md, HEARTBEAT.md, IDENTITY.md, SOUL.md, TOOLS.md, USER.md, SKILL.md, ...) are not adapted for this per journal processing, adapt them.
 * The OpenClaw session per journal should be the one using tools and browsing the web, ...
 * Related to the previous point, the python scripts should be lightweight, they should parse the data from WhereToPublish, and do the loop over each journal that are going to be processed, but filling and browsing should be left to OpenClaw.
 * In many places, absolute path are used, remove this and use relative paths (from the working directory where run_agent.sh is located)

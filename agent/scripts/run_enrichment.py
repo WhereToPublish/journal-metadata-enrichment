@@ -11,7 +11,6 @@ from typing import Any
 import urllib.parse
 
 from enrichment_common import (
-    DEFAULT_PRIORITIES,
     DEFAULT_WTP_DIR,
     GAP_ANALYSIS_SCRIPT,
     GAP_REPORT_PATH,
@@ -64,6 +63,7 @@ def build_prompt(journal_gap: dict[str, Any]) -> str:
         },
         "requested_gaps": journal_gap["gaps"],
     }
+    current_business_model = journal_gap.get("current_business_model", "")
     return (
         "Research exactly one journal.\n"
         "Use the available tools in this run, including web search and page fetch tools, to gather evidence.\n"
@@ -72,7 +72,7 @@ def build_prompt(journal_gap: dict[str, Any]) -> str:
         "Do not write or edit files in this run; return structured JSON only.\n"
         "Do not invent facts or URLs. Only cite URLs you actually visited during this run.\n"
         "Do not propose adding new journals. Work only on the provided journal and the requested gaps for that existing record.\n"
-        "Only suggest values for the requested gaps.\n"
+        "Only suggest values for the requested gaps. Do not include any suggestion whose suggested_value is empty.\n"
         "If a requested field cannot be supported by reliable evidence after a few attempts, leave it unresolved instead of guessing.\n"
         "Use these business model values only: OA diamond, OA, Hybrid, Subscription.\n"
         "Institution type must be a category label, never the institution name itself.\n"
@@ -80,9 +80,17 @@ def build_prompt(journal_gap: dict[str, Any]) -> str:
         "Do not infer Institution or Institution type from a commercial publisher name alone. If the source only identifies a publisher and not a sponsoring institution, leave Institution and Institution type unresolved.\n"
         "Do not use a publisher company name as Institution or Institution type unless the evidence explicitly identifies it as the institution.\n"
         "APC Euros must be a plain integer string with no currency symbol.\n"
-        "Never output APC Euros as 0 unless the evidence explicitly states that the APC is zero or that there is no APC.\n"
+        "Never output APC Euros as 0 unless the evidence explicitly states that there is no APC or that the APC is zero (e.g. 'no APC', 'free to publish', 'APC is 0').\n"
+        + (
+            "The known business model for this journal is 'Subscription'. Do NOT suggest APC Euros = 0 for a Subscription journal.\n"
+            if current_business_model == "Subscription"
+            else ""
+        )
+        + "For the Scimago Journal Title field, always use suggestion_type 'alt_name', never 'fill', even when the current value is empty.\n"
         "Each suggestion must have confidence between 0 and 1, and you should only return suggestions with confidence >= 0.55.\n"
-        "If the evidence is insufficient for all requested gaps, return status \"unresolved\" and an empty suggestions array.\n"
+        "You MUST always return a single JSON object, even if all sources are blocked or unavailable. "
+        "If the evidence is insufficient for all requested gaps, return: "
+        '{\"journal\": \"<name>\", \"suggestions\": [], \"status\": \"unresolved\", \"notes\": \"<brief reason>\"}\n'
         "Return exactly one JSON object with this schema and nothing else:\n"
         "{\n"
         '  "journal": string,\n'
@@ -94,8 +102,16 @@ def build_prompt(journal_gap: dict[str, Any]) -> str:
     )
 
 
-def should_process(journal_gap: dict[str, Any], priorities: set[str]) -> bool:
-    return any(gap["priority"] in priorities for gap in journal_gap["gaps"])
+PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def journal_max_priority(journal_gap: dict[str, Any]) -> int:
+    """Return the sort key for a journal: lowest integer = highest priority."""
+    best = min(
+        (PRIORITY_ORDER.get(gap["priority"], 99) for gap in journal_gap["gaps"]),
+        default=99,
+    )
+    return best
 
 
 def main() -> None:
@@ -106,14 +122,12 @@ def main() -> None:
     parser.add_argument("--state", type=Path, default=RUN_STATE_PATH)
     parser.add_argument("--log-dir", type=Path, default=LOGS_DIR)
     parser.add_argument("--skip-gap-analysis", action="store_true")
-    parser.add_argument("--priorities", default=",".join(DEFAULT_PRIORITIES))
     parser.add_argument("--journal", default="", help="Only process a single journal by exact name.")
-    parser.add_argument("--journal-limit", type=int, default=0, help="0 means no journal count limit.")
-    parser.add_argument("--max-suggestions", type=int, default=50)
+    parser.add_argument("--max-suggestions", type=int, default=15,
+                        help="Stop after this many valid suggestions are written (default: 15).")
     parser.add_argument("--local", action="store_true", help="Run the embedded agent instead of the gateway agent.")
     args = parser.parse_args()
 
-    priorities = {item.strip().lower() for item in args.priorities.split(",") if item.strip()}
     init_suggestions_csv(args.output)
     state = load_state(args.state)
     processed_names = {entry["journal"] for entry in state.get("processed_journals", [])}
@@ -127,19 +141,18 @@ def main() -> None:
     report = load_gap_report(args.gap_report)
     runner = OpenClawRunner(args.log_dir, local=args.local)
 
+    # Sort all journals by their highest-priority gap (high → medium → low).
+    journals = sorted(report["journals"], key=journal_max_priority)
+    if args.journal:
+        journals = [j for j in journals if j["name"] == args.journal]
+
     written_suggestions = 0
     processed_count = 0
-    log(f"Processing journals with priorities: {sorted(priorities)}")
+    log(f"Processing journals sorted by priority (max-suggestions={args.max_suggestions})")
 
-    for journal_gap in report["journals"]:
-        if args.journal and journal_gap["name"] != args.journal:
-            continue
-        if not args.journal and not should_process(journal_gap, priorities):
-            continue
+    for journal_gap in journals:
         if journal_gap["name"] in processed_names:
             continue
-        if args.journal_limit and processed_count >= args.journal_limit:
-            break
         if written_suggestions >= args.max_suggestions:
             break
 
