@@ -18,7 +18,7 @@
 ## read / write
 - Read runtime inputs, logs, and outputs under `agent/output/` when needed.
 - In automated one-journal mode, return structured suggestion objects; the caller persists CSV and state files.
-- Never mutate `AI_Suggestions.csv` directly unless the caller explicitly asks for file editing.
+- Never mutate `AI_suggestions.csv` directly unless the caller explicitly asks for file editing.
 - Never write inside `WhereToPublish.github.io/`.
 
 ## Session Hygiene

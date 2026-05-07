@@ -58,7 +58,7 @@ Q: Which Google Sheet tab should the agent start with for the initial experiment
 A: Genetics & Genomics (gid 1379563174)
 
 Q: How should the agent write its suggestions for review?
-A: Dedicated 'AI_Suggestions' tab in the same spreadsheet
+A: Dedicated 'AI_suggestions' tab in the same spreadsheet
 
 Q: How do you want to interact with the OpenClaw agent (monitor it, or ask it questions of why it did things the way it did)?
 A: WebChat at localhost(no extra setup)

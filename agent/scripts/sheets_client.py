@@ -142,3 +142,64 @@ def write_rows(
         valueInputOption=value_input_option,
         body={"values": rows},
     ).execute()
+
+
+def load_suggestion_keys_from_tabs(
+    service: Any,
+    tab_names: list[str],
+    spreadsheet_id: str = SPREADSHEET_ID,
+) -> set[tuple[str, str, str]]:
+    """Read (journal, field, suggested_value) triples from the given sheet tabs.
+
+    Used before enrichment runs to avoid re-suggesting values already present in
+    AI_suggestions or AI_suggestions_processed.  Missing or empty tabs are silently
+    skipped so the caller degrades gracefully when those tabs do not yet exist.
+
+    Args:
+        service: Authenticated Sheets API service (readonly is sufficient).
+        tab_names: List of tab names to read from.
+        spreadsheet_id: Google Sheets spreadsheet ID (default: WhereToPublish).
+
+    Returns:
+        A set of (journal, field, suggested_value) tuples.
+    """
+    keys: set[tuple[str, str, str]] = set()
+    for tab_name in tab_names:
+        try:
+            result = (
+                service.spreadsheets()
+                .values()
+                .get(
+                    spreadsheetId=spreadsheet_id,
+                    range=tab_name,
+                    valueRenderOption="FORMATTED_VALUE",
+                )
+                .execute()
+            )
+        except Exception:
+            # Tab does not exist or API error — skip gracefully
+            continue
+
+        rows = result.get("values", [])
+        if len(rows) < 2:
+            continue
+
+        header = rows[0]
+        try:
+            journal_col = header.index("journal")
+            field_col = header.index("field")
+            value_col = header.index("suggested_value")
+        except ValueError:
+            # Header structure not recognised — skip this tab
+            continue
+
+        for row in rows[1:]:
+            # Pad short rows
+            padded = row + [""] * max(0, max(journal_col, field_col, value_col) + 1 - len(row))
+            journal = padded[journal_col].strip()
+            field = padded[field_col].strip()
+            suggested_value = padded[value_col].strip()
+            if journal and field and suggested_value:
+                keys.add((journal, field, suggested_value))
+
+    return keys

@@ -10,6 +10,7 @@ import sys
 from typing import Any
 import urllib.parse
 
+import sheets_client
 from enrichment_common import (
     DEFAULT_WTP_DIR,
     GAP_ANALYSIS_SCRIPT,
@@ -126,12 +127,33 @@ def main() -> None:
     parser.add_argument("--max-suggestions", type=int, default=15,
                         help="Stop after this many valid suggestions are written (default: 15).")
     parser.add_argument("--local", action="store_true", help="Run the embedded agent instead of the gateway agent.")
+    parser.add_argument(
+        "--credentials",
+        type=Path,
+        default=None,
+        help="Path to service-account JSON key (default: GOOGLE_SERVICE_ACCOUNT_KEY env var or default path).",
+    )
     args = parser.parse_args()
 
     init_suggestions_csv(args.output)
     state = load_state(args.state)
     processed_names = {entry["journal"] for entry in state.get("processed_journals", [])}
     existing_keys = load_existing_keys(args.output)
+
+    # Merge remote keys from Google Sheets to avoid re-suggesting values already
+    # present in AI_suggestions or AI_suggestions_processed.
+    try:
+        remote_service = sheets_client.get_sheets_service(
+            credentials_path=args.credentials, readonly=True
+        )
+        remote_keys = sheets_client.load_suggestion_keys_from_tabs(
+            remote_service,
+            ["AI_suggestions", "AI_suggestions_processed"],
+        )
+        existing_keys |= remote_keys
+        log(f"Loaded {len(remote_keys)} existing key(s) from remote sheet tabs.")
+    except Exception as exc:
+        log(f"WARNING: could not load remote suggestion keys: {exc} — deduplication will use local CSV only.")
 
     if not args.skip_gap_analysis:
         run_gap_analysis(args.wtp_dir, args.gap_report)

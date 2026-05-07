@@ -159,7 +159,7 @@ Out of scope for this runtime:
 ## 5. Suggestion Output Format
 
 In automated one-journal mode, return suggestion objects in JSON to the caller.
-The caller persists accepted rows to `agent/output/AI_Suggestions.csv`.
+The caller persists accepted rows to `agent/output/AI_suggestions.csv`.
 Do not write that file directly unless the caller explicitly asks for file mutation.
 
 ### Column Schema (exact, in this order)
@@ -229,7 +229,7 @@ START
 - Do NOT use ISSN — this database has no ISSN column.
 - Do NOT modify WhereToPublish.github.io/ files directly.
 - Do NOT write to the Google Sheet.
-- Do NOT write to `AI_Suggestions.csv` directly in automated one-journal runs.
+- Do NOT write to `AI_suggestions.csv` directly in automated one-journal runs.
 - Do NOT hallucinate URLs — only cite pages you actually browsed.
 - Do NOT use Docker or containers.
 - Do NOT schedule runs — this is manual-start only.

@@ -71,7 +71,7 @@ echo
 echo "Run finished."
 echo "Runner log  : $RUNNER_LOG"
 echo "OpenClaw log: $OPENCLAW_LOG"
-echo "Suggestions : $OUTPUT_DIR/AI_Suggestions.csv"
+echo "Suggestions : $OUTPUT_DIR/AI_suggestions.csv"
 echo "State       : $OUTPUT_DIR/state/run_state.json"
 echo
 echo "To stop the gateway: openclaw gateway stop"

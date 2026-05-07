@@ -1,12 +1,13 @@
-"""upload_suggestions.py — Upload AI_Suggestions.csv to the WhereToPublish Google Sheet.
+"""upload_suggestions.py — Upload AI_suggestions.csv to the WhereToPublish Google Sheet.
 
-Reads AI_Suggestions.csv and writes all rows to the 'AI_Suggestions' tab of the
-spreadsheet. A leading 'Approve?' checkbox column is prepended for human review.
+Reads AI_suggestions.csv and writes all rows to the 'AI_suggestions' tab of the
+spreadsheet. A leading 'Status' column (pending / approve / reject) is prepended for
+human review. New suggestions are uploaded with 'pending' status.
 Any existing content in that tab is replaced on each run.
 
 Usage:
     python3 agent/scripts/upload_suggestions.py \
-        [--input agent/output/AI_Suggestions.csv] \
+        [--input agent/output/AI_suggestions.csv] \
         [--credentials ~/.config/wheretopublish/google_service_account.json]
 """
 
@@ -22,9 +23,9 @@ from enrichment_common import SUGGESTIONS_CSV_PATH
 
 SUGGESTIONS_TAB = "AI_suggestions"
 
-# Column order in the AI_Suggestions tab (Approve? is first; the rest match CSV headers)
+# Column order in the AI_suggestions tab (Status is first; the rest match CSV headers)
 OUTPUT_HEADERS = [
-    "Approve?",
+    "Status",
     "journal",
     "field",
     "current_value",
@@ -36,7 +37,7 @@ OUTPUT_HEADERS = [
     "priority",
 ]
 
-CSV_FIELD_ORDER = OUTPUT_HEADERS[1:]  # same list minus 'Approve?'
+CSV_FIELD_ORDER = OUTPUT_HEADERS[1:]  # same list minus 'Status'
 
 
 def upload(input_csv: Path, credentials_path: Path | None) -> None:
@@ -59,11 +60,11 @@ def upload(input_csv: Path, credentials_path: Path | None) -> None:
     sheets_client.get_or_create_tab(service, sheets_client.SPREADSHEET_ID, SUGGESTIONS_TAB)
     sheets_client.clear_tab(service, sheets_client.SPREADSHEET_ID, SUGGESTIONS_TAB)
 
-    # Build data: header row + one row per suggestion (Approve? starts as FALSE)
+    # Build data: header row + one row per suggestion (Status starts as 'pending')
     data: list[list] = [OUTPUT_HEADERS]
     for row in rows:
         data.append(
-            [False]  # Approve? checkbox — starts unchecked
+            ["pending"]  # Status — starts as pending for human review
             + [row.get(col, "") for col in CSV_FIELD_ORDER]
         )
 
@@ -75,13 +76,13 @@ def upload(input_csv: Path, credentials_path: Path | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Upload AI_Suggestions.csv to the WhereToPublish Google Sheet."
+        description="Upload AI_suggestions.csv to the WhereToPublish Google Sheet."
     )
     parser.add_argument(
         "--input",
         type=Path,
         default=SUGGESTIONS_CSV_PATH,
-        help=f"Path to AI_Suggestions.csv (default: {SUGGESTIONS_CSV_PATH})",
+        help=f"Path to AI_suggestions.csv (default: {SUGGESTIONS_CSV_PATH})",
     )
     parser.add_argument(
         "--credentials",

@@ -1,7 +1,7 @@
 # Wiring the Agent to Google Sheets
 
 This file describes what you need to do **after** actual upload to Google Sheets for the
-accept/reject review workflow.
+review workflow.
 
 ## Human Review Interface (Google Apps Script)
 
@@ -9,12 +9,16 @@ accept/reject review workflow.
 
 After upload, the `AI_suggestions` tab has these columns:
 
-| A        | B              | C              | D             | E               | F          | G           | H         | I               | J        |
-| -------- | -------------- | -------------- | ------------- | --------------- | ---------- | ----------- | --------- | --------------- | -------- |
-| Approve? | journal        | field          | current_value | suggested_value | confidence | source_urls | reasoning | suggestion_type | priority |
-| ☐ FALSE | Genome Biology | Business model |               | OA diamond      | 0.92       | https://... | ...       | fill            | high     |
+| A       | B              | C              | D             | E               | F          | G           | H         | I               | J        |
+| ------- | -------------- | -------------- | ------------- | --------------- | ---------- | ----------- | --------- | --------------- | -------- |
+| Status  | journal        | field          | current_value | suggested_value | confidence | source_urls | reasoning | suggestion_type | priority |
+| pending | Genome Biology | Business model |               | OA diamond      | 0.92       | https://... | ...       | fill            | high     |
 
-Team members check the `Approve?` box for each suggestion they accept.
+The **Status** column is a dropdown with three options: `pending`, `approve`, `reject`.
+
+- New suggestions are uploaded with `pending` status.
+- Team members change the status to `approve` or `reject` after reviewing the evidence.
+- Running the Apps Script processes all `approve` and `reject` rows: approved suggestions are applied to the data tabs and archived; rejected suggestions are archived without any data change. `pending` rows are left untouched.
 
 ### 2. Install the Apps Script
 
@@ -24,125 +28,138 @@ Team members check the `Approve?` box for each suggestion they accept.
 
 ```javascript
 // ApplySuggestions.gs
-// Reads approved suggestions from AI_suggestions tab and applies them
-// to the corresponding field tabs (e.g. "Genetics & Genomics").
+// Processes reviewed suggestions from the AI_suggestions tab:
+//   - "approve" → applies the suggestion to the corresponding data tab + archives
+//   - "reject"  → archives only (no data change)
+//   - "pending" → left untouched
 //
-// Run via: Extensions > WhereToPublish > Apply Approved Suggestions
+// Run via: Extensions > WhereToPublish > Apply Reviewed Suggestions
 
-const SPREADSHEET_ID = SpreadsheetApp.getActiveSpreadsheet().getId();
 const SUGGESTIONS_TAB = "AI_suggestions";
-const PROCESSED_TAB = "AI_suggestions_processed";
+const PROCESSED_TAB   = "AI_suggestions_processed";
 
-// Map field names (from Field column values) to their tab names
+// Map tab field values to the actual Google Sheets tab names.
+// Must match the tab names used in the spreadsheet exactly.
 const FIELD_TO_TAB = {
-  "Generalist":                  "Generalist",
-  "Anatomy & Physiology":        "Anatomy & Physiology",
-  "Cancer":                      "Cancer",
-  "Development":                 "Development",
-  "Ecology & Evolution":         "Ecology & Evolution",
-  "Genetics & Genomics":         "Genetics & Genomics",
-  "Immunology":                  "Immunology",
-  "Molecular & Cellular Biology":"Molecular & Cellular Biology",
-  "Neurosciences":               "Neurosciences",
-  "Plants":                      "Plants",
+  "Generalist":                   "Generalists",
+  "Anatomy & Physiology":         "Anatomy & Physiology",
+  "Cancer":                       "Cancer",
+  "Development":                  "Development",
+  "Ecology & Evolution":          "Ecology & Evolution",
+  "Genetics & Genomics":          "Genetics & Genomics",
+  "Immunology":                   "Immunology",
+  "Molecular & Cellular Biology": "Molecular & Cellular Biology",
+  "Neurosciences":                "Neurosciences",
+  "Plants":                       "Plants",
 };
-
-// Column names in the data tabs (must match exactly)
-const DATA_COLUMNS = [
-  "Journal", "Website", "Journal's MAIN field", "Field",
-  "Publisher type", "Publisher", "Institution", "Institution type",
-  "Country", "Business model", "APC Euros", "Scimago Rank",
-  "Scimago Quartile", "H index", "PCI partner", "Scimago Journal Title"
-];
 
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("WhereToPublish")
-    .addItem("Apply Approved Suggestions", "applyApprovedSuggestions")
+    .addItem("Apply Reviewed Suggestions", "applyReviewedSuggestions")
     .addToUi();
 }
 
-function applyApprovedSuggestions() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+function applyReviewedSuggestions() {
+  const ss     = SpreadsheetApp.getActiveSpreadsheet();
   const sugTab = ss.getSheetByName(SUGGESTIONS_TAB);
-  if (!sugTab) { SpreadsheetApp.getUi().alert("Tab '" + SUGGESTIONS_TAB + "' not found."); return; }
+  if (!sugTab) {
+    SpreadsheetApp.getUi().alert("Tab '" + SUGGESTIONS_TAB + "' not found.");
+    return;
+  }
 
-  const data = sugTab.getDataRange().getValues();
+  const data    = sugTab.getDataRange().getValues();
   const headers = data[0];
 
-  // Column indices in AI_suggestions tab
+  // Build column-index map from header row
   const col = {};
   headers.forEach((h, i) => { col[h] = i; });
 
-  const required = ["Approve?", "journal", "field", "suggested_value", "suggestion_type"];
+  const required = ["Status", "journal", "field", "suggested_value", "suggestion_type"];
   for (const r of required) {
-    if (col[r] === undefined) { SpreadsheetApp.getUi().alert("Missing column: " + r); return; }
+    if (col[r] === undefined) {
+      SpreadsheetApp.getUi().alert("Missing column: " + r);
+      return;
+    }
   }
 
-  // Ensure processed tab exists
+  // Ensure the processed archive tab exists with a header row
   let procTab = ss.getSheetByName(PROCESSED_TAB);
-  if (!procTab) { procTab = ss.insertSheet(PROCESSED_TAB); procTab.appendRow(headers); }
+  if (!procTab) {
+    procTab = ss.insertSheet(PROCESSED_TAB);
+    procTab.appendRow(headers);
+  }
 
-  let applied = 0, skipped = 0, errors = [];
+  let applied = 0;
+  let archived = 0;
+  const errors = [];
+  // Collect 1-based row indices to remove from AI_suggestions (bottom-to-top to preserve indices)
+  const rowsToRemove = [];
 
   for (let i = 1; i < data.length; i++) {
-    const row = data[i];
-    if (row[col["Approve?"]] !== true) continue;  // only process checked rows
+    const row    = data[i];
+    const status = String(row[col["Status"]] || "").trim().toLowerCase();
+
+    // Only process "approve" and "reject"; leave "pending" untouched
+    if (status !== "approve" && status !== "reject") continue;
 
     const journalName   = row[col["journal"]];
     const fieldToUpdate = row[col["field"]];
     const suggestedVal  = row[col["suggested_value"]];
-    const sugType       = row[col["suggestion_type"]];
+    const sugType       = String(row[col["suggestion_type"]] || "").trim();
 
-    try {
-      if (sugType === "remove") {
-        // Mark the row with a note rather than deleting it
-        const msg = applyToDataTab(ss, journalName, "Journal", "FLAGGED_FOR_REMOVAL");
-        if (msg) errors.push(msg);
-      } else if (sugType === "add") {
-        // Adding new journals requires manual work — just log it
-        errors.push("MANUAL: add journal '" + journalName + "' — cannot auto-add rows yet.");
-      } else {
-        // fill / correct / alt_name
-        const msg = applyToDataTab(ss, journalName, fieldToUpdate, suggestedVal);
-        if (msg) errors.push(msg);
-        else applied++;
+    if (status === "approve") {
+      try {
+        if (sugType === "remove") {
+          const msg = applyToDataTab(ss, journalName, "Journal", "FLAGGED_FOR_REMOVAL");
+          if (msg) errors.push(msg);
+          else applied++;
+        } else if (sugType === "add") {
+          errors.push("MANUAL: add journal '" + journalName + "' — cannot auto-add rows yet.");
+        } else {
+          // fill / correct / alt_name
+          const msg = applyToDataTab(ss, journalName, fieldToUpdate, suggestedVal);
+          if (msg) errors.push(msg);
+          else applied++;
+        }
+      } catch (e) {
+        errors.push("ERROR on row " + (i + 1) + ": " + e.message);
       }
-    } catch(e) {
-      errors.push("ERROR on row " + (i+1) + ": " + e.message);
     }
 
-    // Archive to processed tab
+    // Archive the row (approve and reject alike)
     procTab.appendRow(row);
-    // Clear approve checkbox
-    sugTab.getRange(i + 1, col["Approve?"] + 1).setValue(false);
+    archived++;
+    rowsToRemove.push(i + 1);  // 1-based sheet row
   }
 
-  const summary = "Applied: " + applied + " | Skipped: " + skipped +
-                  (errors.length ? "\n\nIssues:\n" + errors.join("\n") : "");
+  // Delete processed rows from AI_suggestions (bottom-to-top to preserve row indices)
+  rowsToRemove.reverse().forEach(rowNum => sugTab.deleteRow(rowNum));
+
+  const summary =
+    "Applied: " + applied + " | Archived: " + archived +
+    (errors.length ? "\n\nIssues:\n" + errors.join("\n") : "");
   SpreadsheetApp.getUi().alert("Done!\n\n" + summary);
 }
 
 function applyToDataTab(ss, journalName, fieldName, newValue) {
-  // Find the journal in ALL data tabs (it may appear in multiple)
+  // Search all data tabs — the same journal may appear in multiple tabs
   let found = false;
-  for (const [fieldLabel, tabName] of Object.entries(FIELD_TO_TAB)) {
+  for (const tabName of Object.values(FIELD_TO_TAB)) {
     const sheet = ss.getSheetByName(tabName);
     if (!sheet) continue;
 
-    const vals = sheet.getDataRange().getValues();
-    const headers = vals[0];
-    const journalCol = headers.indexOf("Journal");
-    const targetCol  = headers.indexOf(fieldName);
+    const vals       = sheet.getDataRange().getValues();
+    const hdrs       = vals[0];
+    const journalCol = hdrs.indexOf("Journal");
+    const targetCol  = hdrs.indexOf(fieldName);
 
-    if (journalCol === -1) continue;
-    if (targetCol  === -1) continue;  // field doesn't exist in this tab
+    if (journalCol === -1 || targetCol === -1) continue;
 
     for (let r = 1; r < vals.length; r++) {
       if (String(vals[r][journalCol]).trim().toLowerCase() === journalName.trim().toLowerCase()) {
         sheet.getRange(r + 1, targetCol + 1).setValue(newValue);
         found = true;
-        // Continue searching — same journal may appear in multiple tabs
       }
     }
   }
@@ -162,10 +179,12 @@ function applyToDataTab(ss, journalName, fieldName, newValue) {
 1. Agent runs overnight → produces `AI_suggestions.csv`.
 2. Run `python3 agent/scripts/upload_suggestions.py` to push to the sheet.
 3. Open the spreadsheet → `AI_suggestions` tab.
-4. For each row: read the `reasoning` and `source_urls`, check the `Approve?` box if you agree.
-5. Click **WhereToPublish → Apply Approved Suggestions**.
-6. Approved changes are applied to the data tabs. The `AI_suggestions_processed` tab archives them.
-7. Trigger the GitHub Actions workflow (or run `bash scripts/run.sh`) to regenerate the website data.
+4. For each row: read the `reasoning` and `source_urls`, then set the **Status** dropdown to `approve` or `reject`.
+5. Click **WhereToPublish → Apply Reviewed Suggestions**.
+6. `approve` rows: the suggestion is written to the data tab and the row is moved to `AI_suggestions_processed`.
+7. `reject` rows: the row is moved to `AI_suggestions_processed` without any data change.
+8. `pending` rows remain in `AI_suggestions` for continued review.
+9. Trigger the GitHub Actions workflow (or run `bash scripts/run.sh`) to regenerate the website data.
 
 ---
 

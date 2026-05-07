@@ -9,18 +9,35 @@ The current runtime is built around one journal per OpenClaw session.
 1. `run_agent.sh` is the only entry point.
 2. The launcher uses the repo-local `.venv/bin/python`, checks that `polars` is importable, configures the OpenClaw workspace, and redirects OpenClaw logs directly to a timestamped file.
 3. `agent/scripts/gap_analysis.py` verifies that required external data files exist in the WhereToPublish project, downloads **all 10 Google Sheets tabs** (Generalists, Anatomy & Physiology, Cancer, Development, Ecology & Evolution, Genetics & Genomics, Immunology, Molecular & Cellular Biology, Neurosciences, Plants) via the Sheets API, refreshes the WhereToPublish pipeline, and writes `agent/output/gap_report.json` unless `--skip-gap-analysis` is passed.
-4. `agent/scripts/run_enrichment.py` selects journals from the gap report — all journals across all tabs are processed, sorted by priority (high → medium → low) — and opens one fresh OpenClaw session per journal. It stops when `--max-suggestions` valid suggestions have been written (default: 15) or all journals are exhausted.
+4. `agent/scripts/run_enrichment.py` loads remote suggestion keys from the `AI_suggestions` and `AI_suggestions_processed` Google Sheets tabs, then selects journals from the gap report — all journals across all tabs are processed, sorted by priority (high → medium → low) — and opens one fresh OpenClaw session per journal. It stops when `--max-suggestions` valid suggestions have been written (default: 15) or all journals are exhausted.
 5. OpenClaw does the journal-level research with tools and returns one JSON object.
-6. Python validates that JSON and writes only accepted rows to `agent/output/AI_Suggestions.csv` plus run state and logs.
-7. `agent/scripts/upload_suggestions.py` pushes `AI_Suggestions.csv` to the `AI_suggestions` tab of the WhereToPublish Google Sheet for human review.
+6. Python validates that JSON and writes only accepted rows to `agent/output/AI_suggestions.csv` plus run state and logs. Suggestions already present in either the local CSV or the remote Google Sheet tabs are deduplicated before persistence.
+7. `agent/scripts/upload_suggestions.py` pushes `AI_suggestions.csv` to the `AI_suggestions` tab of the WhereToPublish Google Sheet. Each row gets a **Status** column (pending / approve / reject); new rows are uploaded as `pending`.
 
 The system never writes directly to the data tabs of the Google Sheet. Persisted suggestions are always staged in `AI_suggestions` for human review.
+
+## Review Workflow
+
+After upload, team members open the `AI_suggestions` tab and set each row's **Status** to:
+
+- `approve` — apply the suggestion to the data tab
+- `reject` — discard the suggestion (archived for analysis)
+- `pending` — not yet reviewed (default after upload)
+
+Running **WhereToPublish → Apply Reviewed Suggestions** from the Apps Script menu:
+
+- `approve` rows: the suggested value is written to the journal's field in the appropriate data tab, then the row is moved to `AI_suggestions_processed`.
+- `reject` rows: the row is moved to `AI_suggestions_processed` without any data change.
+- `pending` rows are left untouched.
+
+The `AI_suggestions_processed` archive contains all reviewed suggestions (approve + reject) and can be used to analyze agent performance over time (see `NEXT_STEPS.md`).
 
 ## Runtime Boundaries
 
 - Python owns orchestration, gap-report loading, journal selection, deduplication, validation, and persistence.
 - OpenClaw owns journal-level browsing, source gathering, and JSON suggestion generation.
-- Google Sheets API (service-account auth) is used for both downloading sheet tabs and uploading suggestions.
+- Google Sheets API (service-account auth) is used for downloading sheet tabs, uploading suggestions, and loading remote deduplication keys.
+- Before each run, the enrichment pipeline loads remote keys from `AI_suggestions` and `AI_suggestions_processed` to avoid re-generating suggestions that are already under review or have already been processed.
 - The current agent runtime works only on journals already present in the caller-selected gap backlog.
 - The model does not edit CSV or state files in the normal automation path.
 - `WhereToPublish.github.io/` is treated as read-only input during enrichment runs.
@@ -30,15 +47,17 @@ The system never writes directly to the data tabs of the Google Sheet. Persisted
 
 - `run_agent.sh`: launcher, gateway bootstrap, live log streaming, and `.venv` preflight.
 - `requirements.txt`: Python dependencies for the repo-local virtual environment.
-- `agent/scripts/sheets_client.py`: shared Google Sheets API module (auth, download, upload helpers).
+- `agent/scripts/sheets_client.py`: shared Google Sheets API module (auth, download, upload helpers, dropdown validation, remote key loading).
 - `agent/scripts/gap_analysis.py`: verifies required external data files are present in `WhereToPublish.github.io/data_extraction/` (fails fast with a clear error if any are missing), downloads all 10 sheet tabs via the Sheets API, refreshes the WTP pipeline, and writes `agent/output/gap_report.json`.
-- `agent/scripts/run_enrichment.py`: prompts OpenClaw, loops over journals, and records run state.
+- `agent/scripts/run_enrichment.py`: loads remote deduplication keys from Google Sheets, prompts OpenClaw per journal, loops over journals, and records run state.
 - `agent/scripts/openclaw_runtime.py`: runs `openclaw agent --json` and retries invalid non-JSON replies once.
 - `agent/scripts/suggestions_io.py`: validates and persists only supported suggestion rows.
 - `agent/scripts/fetch_sheet.py`: standalone utility to download any spreadsheet tab via the Sheets API.
-- `agent/scripts/upload_suggestions.py`: uploads `AI_Suggestions.csv` to the `AI_suggestions` tab of the spreadsheet.
+- `agent/scripts/upload_suggestions.py`: uploads `AI_suggestions.csv` to the `AI_suggestions` tab with a Status column (pending/approve/reject); all new rows start as `pending`.
 - `agent/workspace/`: OpenClaw workspace instructions for the per-journal tool-driven workflow.
 - `WhereToPublish.github.io/`: source data and pipeline, treated as input only.
+- `GOOGLE_APP_SCRIPT.md`: Apps Script setup for the human review workflow.
+- `NEXT_STEPS.md`: roadmap for using the suggestion history to analyze and improve agent performance.
 
 ## Requirements
 
@@ -73,7 +92,8 @@ The launcher:
 2. checks that `.venv/bin/python` can import `polars`
 3. configures the OpenClaw workspace and model
 4. restarts the gateway and redirects `openclaw logs --follow --json` to a timestamped JSONL file
-5. runs `agent/scripts/run_enrichment.py` — journals are sorted by priority and it stops at `--max-suggestions` (default 15) valid suggestions
+5. loads remote deduplication keys from `AI_suggestions` and `AI_suggestions_processed`
+6. runs `agent/scripts/run_enrichment.py` — journals are sorted by priority and it stops at `--max-suggestions` (default 15) valid suggestions
 
 Live monitoring is via terminal output and the runner log at `agent/output/logs/run-*.runner.log`.
 
@@ -81,19 +101,19 @@ On a full run, gap analysis downloads all 10 tabs (≈2400 journals) and typical
 
 ## Upload Suggestions to Google Sheet
 
-After a run, push `AI_Suggestions.csv` to the spreadsheet for review:
+After a run, push `AI_suggestions.csv` to the spreadsheet for review:
 
 ```bash
 .venv/bin/python agent/scripts/upload_suggestions.py
 ```
 
-This replaces the content of the `AI_suggestions` tab with the current suggestions, adding an `Approve?` checkbox column. Team members check the rows they want to apply, then run the **WhereToPublish → Apply Approved Suggestions** Apps Script from the spreadsheet menu.
+This replaces the content of the `AI_suggestions` tab with the current suggestions. Each row has a **Status** column (pending / approve / reject) set to `pending` by default. Team members set the status for each row, then run **WhereToPublish → Apply Reviewed Suggestions** from the Apps Script menu.
 
 Options:
 
 ```bash
 # Custom input file
-.venv/bin/python agent/scripts/upload_suggestions.py --input /path/to/AI_Suggestions.csv
+.venv/bin/python agent/scripts/upload_suggestions.py --input /path/to/AI_suggestions.csv
 
 # Custom credentials path
 .venv/bin/python agent/scripts/upload_suggestions.py --credentials /path/to/key.json
@@ -146,7 +166,7 @@ If no suggestion survives validation, the journal is written as `unresolved`.
 
 Default result files:
 
-- `agent/output/AI_Suggestions.csv`
+- `agent/output/AI_suggestions.csv`
 - `agent/output/gap_report.json`
 - `agent/output/state/run_state.json`
 
@@ -165,25 +185,10 @@ Checkpoint files:
 
 - `agent/output/state/checkpoint_suggestions_*.csv`
 
-## Current Runtime Behavior
-
-The current implementation has been verified with real, non-dry runs.
-
-- the full launcher verifies external data files then downloads all 10 Google Sheets tabs and refreshes `agent/output/gap_report.json`
-- if any required extraction file is missing, gap analysis exits immediately with an actionable error listing the missing files and the command to populate them
-- the gap report covers all 10 biology field tabs (≈2400 journals); each journal entry includes a `tab` field indicating which sheet it came from
-- journals appearing in multiple tabs are deduplicated by name; the first-seen tab's data is used
-- the agent stays within the existing gap backlog across all tabs and does not propose adding new journals
-- `APC Euros = 0` is accepted only when the model's reasoning contains an explicit no-APC statement; it is always rejected for journals with a known `Subscription` business model
-- `Scimago Journal Title` suggestions are accepted only as `alt_name` type and only when the suggested value differs meaningfully from the journal name
-- suggestions with empty `suggested_value` are silently dropped
-- blocked-source cases stay unresolved with no persisted rows
-- when the model returns prose instead of JSON, the runner retries once with a repair prompt that includes a concrete valid JSON example
-
-Known runtime limitation:
+Known runtime limitations:
 
 - the current OpenClaw environment may not have a working `web_search` backend, so the prompt provides direct official-site, DOAJ, and Scimago lookup URLs and falls back to `unresolved` when those sources are blocked or insufficient
-- `--skip-download` now skips downloading all 10 tabs (not just one); use it when the `data_extracted/` CSVs are already current
+- `--skip-download` skips all 10 tab downloads; use it when the `data_extracted/` CSVs are already current
 
 ## Stop / Reset
 

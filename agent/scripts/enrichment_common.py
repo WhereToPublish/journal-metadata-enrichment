@@ -12,7 +12,7 @@ LOGS_DIR = OUTPUT_DIR / "logs"
 STATE_DIR = OUTPUT_DIR / "state"
 DEFAULT_WTP_DIR = PROJECT_ROOT / "WhereToPublish.github.io"
 GAP_REPORT_PATH = OUTPUT_DIR / "gap_report.json"
-SUGGESTIONS_CSV_PATH = OUTPUT_DIR / "AI_Suggestions.csv"
+SUGGESTIONS_CSV_PATH = OUTPUT_DIR / "AI_suggestions.csv"
 RUN_STATE_PATH = STATE_DIR / "run_state.json"
 GAP_ANALYSIS_SCRIPT = SCRIPT_DIR / "gap_analysis.py"
 
