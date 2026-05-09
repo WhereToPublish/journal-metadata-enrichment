@@ -12,12 +12,18 @@ Usage:
 """
 
 from __future__ import annotations
-
+from typing import Any
 import argparse
 import csv
 import sys
 from pathlib import Path
 
+# Resolve the WTP scripts directory before importing sheets_client so we always
+# use the canonical implementation in WhereToPublish.github.io/scripts/ rather
+# than a duplicate copy inside the agent folder.
+WTP_SCRIPTS = Path(__file__).parent.parent.parent / "WhereToPublish.github.io" / "scripts"
+if str(WTP_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(WTP_SCRIPTS))
 import sheets_client
 from enrichment_common import SUGGESTIONS_CSV_PATH
 
@@ -40,6 +46,25 @@ OUTPUT_HEADERS = [
 CSV_FIELD_ORDER = OUTPUT_HEADERS[1:]  # same list minus 'Status'
 
 
+def get_or_create_tab(service: Any, spreadsheet_id: str, tab_name: str) -> None:
+    """Ensure a tab with the given name exists; create it if it doesn't."""
+    spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    existing_titles = {s["properties"]["title"] for s in spreadsheet["sheets"]}
+    if tab_name not in existing_titles:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]},
+        ).execute()
+
+
+def clear_tab(service: Any, spreadsheet_id: str, tab_name: str) -> None:
+    """Clear all content from a tab."""
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=f"{tab_name}!A1:Z",
+    ).execute()
+
+
 def upload(input_csv: Path, credentials_path: Path | None) -> None:
     if not input_csv.exists():
         print(f"ERROR: input file not found: {input_csv}", file=sys.stderr)
@@ -57,8 +82,8 @@ def upload(input_csv: Path, credentials_path: Path | None) -> None:
 
     service = sheets_client.get_sheets_service(credentials_path=credentials_path, readonly=False)
 
-    sheets_client.get_or_create_tab(service, sheets_client.SPREADSHEET_ID, SUGGESTIONS_TAB)
-    sheets_client.clear_tab(service, sheets_client.SPREADSHEET_ID, SUGGESTIONS_TAB)
+    get_or_create_tab(service, sheets_client.SPREADSHEET_ID, SUGGESTIONS_TAB)
+    clear_tab(service, sheets_client.SPREADSHEET_ID, SUGGESTIONS_TAB)
 
     # Build data: header row + one row per suggestion (Status starts as 'pending')
     data: list[list] = [OUTPUT_HEADERS]

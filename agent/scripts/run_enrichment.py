@@ -3,34 +3,78 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
-import json
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any
 import urllib.parse
 
+# Resolve the WTP scripts directory before importing sheets_client so we always
+# use the canonical implementation in WhereToPublish.github.io/scripts/ rather
+# than a duplicate copy inside the agent folder.
+WTP_SCRIPTS = Path(__file__).parent.parent.parent / "WhereToPublish.github.io" / "scripts"
+if str(WTP_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(WTP_SCRIPTS))
 import sheets_client
-from enrichment_common import (
-    DEFAULT_WTP_DIR,
-    GAP_ANALYSIS_SCRIPT,
-    GAP_REPORT_PATH,
-    LOGS_DIR,
-    RUN_STATE_PATH,
-    SUGGESTIONS_CSV_PATH,
-    STATE_DIR,
-    slugify,
-)
 from openclaw_runtime import OpenClawRunner
-from suggestions_io import (
-    append_suggestions,
-    init_suggestions_csv,
-    load_existing_keys,
-    load_state,
-    sanitize_agent_result,
-    save_state,
-    write_checkpoint,
-)
+from suggestions_io import *
+
+
+def load_suggestion_keys_from_tabs(service: Any, tab_names: list[str],
+                                   spreadsheet_id: str = sheets_client.SPREADSHEET_ID) -> set[tuple[str, str, str]]:
+    """Read (journal, field, suggested_value) triples from the given sheet tabs.
+
+    Used before enrichment runs to avoid re-suggesting values already present in
+    AI_suggestions or AI_suggestions_processed.  Missing or empty tabs are silently
+    skipped so the caller degrades gracefully when those tabs do not yet exist.
+
+    Args:
+        service: Authenticated Sheets API service (readonly is sufficient).
+        tab_names: List of tab names to read from.
+        spreadsheet_id: Google Sheets spreadsheet ID (default: WhereToPublish).
+
+    Returns:
+        A set of (journal, field, suggested_value) tuples.
+    """
+    keys: set[tuple[str, str, str]] = set()
+    for tab_name in tab_names:
+        try:
+            result = (
+                service.spreadsheets()
+                .values()
+                .get(
+                    spreadsheetId=spreadsheet_id,
+                    range=tab_name,
+                    valueRenderOption="FORMATTED_VALUE",
+                )
+                .execute()
+            )
+        except Exception:
+            # Tab does not exist or API error — skip gracefully
+            continue
+
+        rows = result.get("values", [])
+        if len(rows) < 2:
+            continue
+
+        header = rows[0]
+        try:
+            journal_col = header.index("journal")
+            field_col = header.index("field")
+            value_col = header.index("suggested_value")
+        except ValueError:
+            # Header structure not recognised — skip this tab
+            continue
+
+        for row in rows[1:]:
+            # Pad short rows
+            padded = row + [""] * max(0, max(journal_col, field_col, value_col) + 1 - len(row))
+            journal = padded[journal_col].strip()
+            field = padded[field_col].strip()
+            suggested_value = padded[value_col].strip()
+            if journal and field and suggested_value:
+                keys.add((journal, field, suggested_value))
+
+    return keys
 
 
 def log(message: str) -> None:
@@ -50,56 +94,65 @@ def load_gap_report(path: Path) -> dict[str, Any]:
 
 def build_prompt(journal_gap: dict[str, Any]) -> str:
     encoded_name = urllib.parse.quote(journal_gap["name"])
+    e_issn = journal_gap.get("e_issn", "")
+    p_issn = journal_gap.get("p_issn", "")
+    issn_l = journal_gap.get("issn_l", "")
+    # Use the most useful ISSN for a DOAJ direct lookup (e-ISSN preferred, then p-ISSN, then ISSN-L)
+    doaj_issn = e_issn or p_issn or issn_l
     payload = {
         "journal": journal_gap["name"],
         "known_metadata": {
             "website": journal_gap.get("website", ""),
             "publisher": journal_gap.get("current_publisher", ""),
             "business_model": journal_gap.get("current_business_model", ""),
+            "e_issn": e_issn,
+            "p_issn": p_issn,
+            "issn_l": issn_l,
         },
         "lookup_urls": {
             "official_website": journal_gap.get("website", ""),
             "doaj_search": f"https://doaj.org/search/journals/{encoded_name}",
+            "doaj_by_issn": f"https://doaj.org/toc/{doaj_issn}" if doaj_issn else "",
             "scimago_search": f"https://www.scimagojr.com/journalsearch.php?q={encoded_name}&tip=jou",
         },
         "requested_gaps": journal_gap["gaps"],
     }
     current_business_model = journal_gap.get("current_business_model", "")
     return (
-        "Research exactly one journal.\n"
-        "Use the available tools in this run, including web search and page fetch tools, to gather evidence.\n"
-        "If web search is unavailable, use the provided lookup URLs directly with the fetch tool before falling back to other public sources.\n"
-        "Prefer this source order when applicable: DOAJ, the official publisher or journal website, Scimago, then other public sources.\n"
-        "Do not write or edit files in this run; return structured JSON only.\n"
-        "Do not invent facts or URLs. Only cite URLs you actually visited during this run.\n"
-        "Do not propose adding new journals. Work only on the provided journal and the requested gaps for that existing record.\n"
-        "Only suggest values for the requested gaps. Do not include any suggestion whose suggested_value is empty.\n"
-        "If a requested field cannot be supported by reliable evidence after a few attempts, leave it unresolved instead of guessing.\n"
-        "Use these business model values only: OA diamond, OA, Hybrid, Subscription.\n"
-        "Institution type must be a category label, never the institution name itself.\n"
-        "Use only these institution type labels when supported by the evidence: Society, Society/Association, University, Research Institute.\n"
-        "Do not infer Institution or Institution type from a commercial publisher name alone. If the source only identifies a publisher and not a sponsoring institution, leave Institution and Institution type unresolved.\n"
-        "Do not use a publisher company name as Institution or Institution type unless the evidence explicitly identifies it as the institution.\n"
-        "APC Euros must be a plain integer string with no currency symbol.\n"
-        "Never output APC Euros as 0 unless the evidence explicitly states that there is no APC or that the APC is zero (e.g. 'no APC', 'free to publish', 'APC is 0').\n"
-        + (
-            "The known business model for this journal is 'Subscription'. Do NOT suggest APC Euros = 0 for a Subscription journal.\n"
-            if current_business_model == "Subscription"
-            else ""
-        )
-        + "For the Scimago Journal Title field, always use suggestion_type 'alt_name', never 'fill', even when the current value is empty.\n"
-        "Each suggestion must have confidence between 0 and 1, and you should only return suggestions with confidence >= 0.55.\n"
-        "You MUST always return a single JSON object, even if all sources are blocked or unavailable. "
-        "If the evidence is insufficient for all requested gaps, return: "
-        '{\"journal\": \"<name>\", \"suggestions\": [], \"status\": \"unresolved\", \"notes\": \"<brief reason>\"}\n'
-        "Return exactly one JSON object with this schema and nothing else:\n"
-        "{\n"
-        '  "journal": string,\n'
-        '  "suggestions": [{"field": string, "current_value": string, "suggested_value": string, "confidence": number, "source_urls": string[], "reasoning": string, "suggestion_type": string, "priority": string}],\n'
-        '  "status": "ok" | "unresolved",\n'
-        '  "notes": string\n'
-        "}\n\n"
-        f"Evidence:\n{json.dumps(payload, indent=2, ensure_ascii=False)}"
+            "Research exactly one journal.\n"
+            "Use the available tools in this run, including web search and page fetch tools, to gather evidence.\n"
+            "If web search is unavailable, use the provided lookup URLs directly with the fetch tool before falling back to other public sources.\n"
+            "Prefer this source order when applicable: DOAJ, the official publisher or journal website, Scimago, then other public sources.\n"
+            "Do not write or edit files in this run; return structured JSON only.\n"
+            "Do not invent facts or URLs. Only cite URLs you actually visited during this run.\n"
+            "Do not propose adding new journals. Work only on the provided journal and the requested gaps for that existing record.\n"
+            "Only suggest values for the requested gaps. Do not include any suggestion whose suggested_value is empty.\n"
+            "If a requested field cannot be supported by reliable evidence after a few attempts, leave it unresolved instead of guessing.\n"
+            "Use these business model values only: OA diamond, OA, Hybrid, Subscription.\n"
+            "Institution type must be a category label, never the institution name itself.\n"
+            "Use only these institution type labels when supported by the evidence: Society, Society/Association, University, Research Institute.\n"
+            "Do not infer Institution or Institution type from a commercial publisher name alone. If the source only identifies a publisher and not a sponsoring institution, leave Institution and Institution type unresolved.\n"
+            "Do not use a publisher company name as Institution or Institution type unless the evidence explicitly identifies it as the institution.\n"
+            "APC Euros must be a plain integer string with no currency symbol.\n"
+            "Never output APC Euros as 0 unless the evidence explicitly states that there is no APC or that the APC is zero (e.g. 'no APC', 'free to publish', 'APC is 0').\n"
+            + (
+                "The known business model for this journal is 'Subscription'. Do NOT suggest APC Euros = 0 for a Subscription journal.\n"
+                if current_business_model == "Subscription"
+                else ""
+            )
+            + "For the Alternative journal name field, always use suggestion_type 'alt_name', never 'fill', even when the current value is empty.\n"
+              "Each suggestion must have confidence between 0 and 1, and you should only return suggestions with confidence >= 0.55.\n"
+              "You MUST always return a single JSON object, even if all sources are blocked or unavailable. "
+              "If the evidence is insufficient for all requested gaps, return: "
+              '{\"journal\": \"<name>\", \"suggestions\": [], \"status\": \"unresolved\", \"notes\": \"<brief reason>\"}\n'
+              "Return exactly one JSON object with this schema and nothing else:\n"
+              "{\n"
+              '  "journal": string,\n'
+              '  "suggestions": [{"field": string, "current_value": string, "suggested_value": string, "confidence": number, "source_urls": string[], "reasoning": string, "suggestion_type": string, "priority": string}],\n'
+              '  "status": "ok" | "unresolved",\n'
+              '  "notes": string\n'
+              "}\n\n"
+              f"Evidence:\n{json.dumps(payload, indent=2, ensure_ascii=False)}"
     )
 
 
@@ -124,7 +177,7 @@ def main() -> None:
     parser.add_argument("--log-dir", type=Path, default=LOGS_DIR)
     parser.add_argument("--skip-gap-analysis", action="store_true")
     parser.add_argument("--journal", default="", help="Only process a single journal by exact name.")
-    parser.add_argument("--max-suggestions", type=int, default=15,
+    parser.add_argument("--max-suggestions", type=int, default=125,
                         help="Stop after this many valid suggestions are written (default: 15).")
     parser.add_argument("--local", action="store_true", help="Run the embedded agent instead of the gateway agent.")
     parser.add_argument(
@@ -146,7 +199,7 @@ def main() -> None:
         remote_service = sheets_client.get_sheets_service(
             credentials_path=args.credentials, readonly=True
         )
-        remote_keys = sheets_client.load_suggestion_keys_from_tabs(
+        remote_keys = load_suggestion_keys_from_tabs(
             remote_service,
             ["AI_suggestions", "AI_suggestions_processed"],
         )

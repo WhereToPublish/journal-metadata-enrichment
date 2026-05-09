@@ -47,15 +47,15 @@ The `AI_suggestions_processed` archive contains all reviewed suggestions (approv
 
 - `run_agent.sh`: launcher, gateway bootstrap, live log streaming, and `.venv` preflight.
 - `requirements.txt`: Python dependencies for the repo-local virtual environment.
-- `agent/scripts/sheets_client.py`: shared Google Sheets API module (auth, download, upload helpers, dropdown validation, remote key loading).
+- `WhereToPublish.github.io/scripts/sheets_client.py`: shared Google Sheets API module (auth, download, upload helpers, `get_or_create_tab`, `clear_tab`, `load_suggestion_keys_from_tabs`). Used by both the WTP pipeline scripts and the agent scripts.
 - `agent/scripts/gap_analysis.py`: verifies required external data files are present in `WhereToPublish.github.io/data_extraction/` (fails fast with a clear error if any are missing), downloads all 10 sheet tabs via the Sheets API, refreshes the WTP pipeline, and writes `agent/output/gap_report.json`.
 - `agent/scripts/run_enrichment.py`: loads remote deduplication keys from Google Sheets, prompts OpenClaw per journal, loops over journals, and records run state.
 - `agent/scripts/openclaw_runtime.py`: runs `openclaw agent --json` and retries invalid non-JSON replies once.
 - `agent/scripts/suggestions_io.py`: validates and persists only supported suggestion rows.
-- `agent/scripts/fetch_sheet.py`: standalone utility to download any spreadsheet tab via the Sheets API.
 - `agent/scripts/upload_suggestions.py`: uploads `AI_suggestions.csv` to the `AI_suggestions` tab with a Status column (pending/approve/reject); all new rows start as `pending`.
 - `agent/workspace/`: OpenClaw workspace instructions for the per-journal tool-driven workflow.
 - `WhereToPublish.github.io/`: source data and pipeline, treated as input only.
+- `WhereToPublish.github.io/scripts/fetch_sheet.py`: standalone utility to download any spreadsheet tab by field slug via the Sheets API.
 - `GOOGLE_APP_SCRIPT.md`: Apps Script setup for the human review workflow.
 - `NEXT_STEPS.md`: roadmap for using the suggestion history to analyze and improve agent performance.
 
@@ -156,9 +156,10 @@ Only requested fields are eligible for persistence. The validator rejects rows t
 
 - publisher-as-institution guesses
 - institution types without a valid institution value
-- `Scimago Journal Title` suggestions that are not true `alt_name` rows
-- `Scimago Journal Title` values that normalize to the original journal name
+- `Alternative journal name` suggestions that are not true `alt_name` rows
+- `Alternative journal name` values that normalize to the original journal name
 - `APC Euros = 0` rows unless the reasoning explicitly states there is no APC
+- `e-ISSN`, `p-ISSN`, and `ISSN-L` values that are not formatted as `XXXX-XXXX`
 
 If no suggestion survives validation, the journal is written as `unresolved`.
 

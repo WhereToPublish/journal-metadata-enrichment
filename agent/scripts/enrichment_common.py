@@ -11,6 +11,7 @@ OUTPUT_DIR = AGENT_DIR / "output"
 LOGS_DIR = OUTPUT_DIR / "logs"
 STATE_DIR = OUTPUT_DIR / "state"
 DEFAULT_WTP_DIR = PROJECT_ROOT / "WhereToPublish.github.io"
+WTP_SCRIPTS_DIR = DEFAULT_WTP_DIR / "scripts"
 GAP_REPORT_PATH = OUTPUT_DIR / "gap_report.json"
 SUGGESTIONS_CSV_PATH = OUTPUT_DIR / "AI_suggestions.csv"
 RUN_STATE_PATH = STATE_DIR / "run_state.json"
@@ -37,7 +38,10 @@ ALLOWED_FIELDS = {
     "Publisher type",
     "Institution",
     "Institution type",
-    "Scimago Journal Title",
+    "Alternative journal name",
+    "e-ISSN",
+    "p-ISSN",
+    "ISSN-L",
 }
 
 ALLOWED_PRIORITIES = {"high", "medium", "low"}

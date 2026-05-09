@@ -28,6 +28,12 @@ import sys
 from pathlib import Path
 from datetime import date, datetime
 
+# Resolve the WTP scripts directory before importing sheets_client so we always
+# use the canonical implementation in WhereToPublish.github.io/scripts/ rather
+# than a duplicate copy inside the agent folder.
+WTP_SCRIPTS = Path(__file__).parent.parent.parent / "WhereToPublish.github.io" / "scripts"
+if str(WTP_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(WTP_SCRIPTS))
 import sheets_client as _sheets_client
 
 # ---------------------------------------------------------------------------
@@ -59,6 +65,9 @@ FIELD_PRIORITIES = {
     "Publisher type":   ("medium", 3),
     "Institution":      ("low",    2),
     "Institution type": ("low",    1),
+    "e-ISSN":           ("low",    0),
+    "p-ISSN":           ("low",    0),
+    "ISSN-L":           ("low",    0),
 }
 
 
@@ -180,15 +189,15 @@ def compute_gaps(raw_row: dict, enriched_row: dict | None) -> list[dict]:
 
     # Detect journals with no Scimago match — prime candidates for alt_name suggestion
     if is_empty(row.get("Scimago Rank", "")) and is_empty(row.get("Scimago Quartile", "")):
-        scimago_alt = raw_row.get("Scimago Journal Title", "")
+        alt_journal_name = raw_row.get("Alternative journal name", "")
         gaps.append({
-            "field": "Scimago Journal Title",
-            "current_value": scimago_alt if not is_empty(scimago_alt) else "",
+            "field": "Alternative journal name",
+            "current_value": alt_journal_name if not is_empty(alt_journal_name) else "",
             "gap_type": "alt_name",
             "priority": "high",
             "priority_weight": 8,
             "note": (
-                "Journal has no Scimago data. Providing the correct Scimago Journal Title "
+                "Journal has no Scimago data. Providing the correct alternative journal name "
                 "enables automatic enrichment with Rank, Quartile, H index, and Publisher."
             ),
         })
@@ -238,12 +247,18 @@ def _process_tab(slug: str, wtp_dir: Path) -> tuple[list[dict], list[str]]:
         for gap in gaps:
             gap.pop("priority_weight", None)
 
+        # Prefer enriched ISSN values (pipeline may have filled them from Scimago/DOAJ/OpenAPC);
+        # fall back to raw row when the enriched row is unavailable.
+        row_for_issn = enriched_row if enriched_row else raw_row
         entries.append({
             "name": journal_name,
             "tab": tab_name,
             "website": enriched_row.get("Website", "") if enriched_row else raw_row.get("Website", ""),
             "current_publisher": enriched_row.get("Publisher", "") if enriched_row else "",
             "current_business_model": enriched_row.get("Business model", "") if enriched_row else "",
+            "e_issn": row_for_issn.get("e-ISSN", ""),
+            "p_issn": row_for_issn.get("p-ISSN", ""),
+            "issn_l": row_for_issn.get("ISSN-L", ""),
             "gaps": gaps,
         })
 
@@ -283,11 +298,11 @@ def build_gap_report(wtp_dir: Path) -> dict:
             for gap in entry["gaps"]:
                 priority_counts[gap["priority"]] = priority_counts.get(gap["priority"], 0) + 1
 
-    journals_with_gaps.sort(key=lambda j: (
-        0 if any(g["priority"] == "high" for g in j["gaps"])
-        else 1 if any(g["priority"] == "medium" for g in j["gaps"])
+    journals_with_gaps.sort(key=lambda k: (
+        0 if any(g["priority"] == "high" for g in k["gaps"])
+        else 1 if any(g["priority"] == "medium" for g in k["gaps"])
         else 2,
-        j["name"].lower(),
+        k["name"].lower(),
     ))
 
     field_gap_counts: dict[str, int] = {}

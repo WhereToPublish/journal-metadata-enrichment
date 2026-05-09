@@ -10,17 +10,17 @@ The current end-to-end flow is:
 run_agent.sh
   -> agent/scripts/gap_analysis.py (unless skipped)
     -> verifies external data files exist in WhereToPublish.github.io/data_extraction/
-    -> Google Sheets API (sheets_client.py) — downloads all 10 sheet tabs
+    -> WhereToPublish.github.io/scripts/sheets_client.py — downloads all 10 sheet tabs
     -> WhereToPublish pipeline (update_extracted.py → data_process.py)
   -> agent/scripts/run_enrichment.py
-    -> sheets_client.load_suggestion_keys_from_tabs() — loads remote deduplication keys
+    -> WhereToPublish.github.io/scripts/sheets_client.load_suggestion_keys_from_tabs() — loads remote deduplication keys
     -> agent/scripts/openclaw_runtime.py
     -> one OpenClaw session per journal
     -> agent/scripts/suggestions_io.py
   -> agent/output/*
 
 agent/scripts/upload_suggestions.py  (run manually after enrichment)
-  -> Google Sheets API (sheets_client.py) — writes AI_suggestions tab with Status dropdown
+  -> WhereToPublish.github.io/scripts/sheets_client.py — writes AI_suggestions tab with Status dropdown
 ```
 
 Key runtime properties:
@@ -70,24 +70,19 @@ Current model behavior:
 - extra launcher arguments are forwarded directly to `run_enrichment.py`
 
 ## Python Modules
-### agent/scripts/sheets_client.py
+### WhereToPublish.github.io/scripts/sheets_client.py
 
-Shared Google Sheets API module.
+Shared Google Sheets API module — canonical implementation used by both the WTP pipeline scripts and all agent scripts.
 
-- defines `SPREADSHEET_ID` and `DEFAULT_CREDENTIALS_PATH` (resolved from `GOOGLE_SERVICE_ACCOUNT_KEY` env var or `~/.config/wheretopublish/google_service_account.json`)
+- defines `SPREADSHEET_ID`, `VARIABLES_TAB_NAME`, and `DEFAULT_CREDENTIALS_PATH` (resolved from `GOOGLE_SERVICE_ACCOUNT_KEY` env var or `~/.config/wheretopublish/google_service_account.json`)
 - defines `SHEET_TAB_NAMES` mapping field slugs to actual Google Sheets tab names
 - provides `get_sheets_service(credentials_path, readonly)` — returns an authenticated Sheets API v4 service
 - provides `download_tab_as_csv(service, tab_name, dest_path)` — downloads a tab and writes it as CSV
-- provides `get_or_create_tab`, `clear_tab`, and `write_rows` helpers used by the upload script
-- provides `load_suggestion_keys_from_tabs(service, tab_names, spreadsheet_id)` — reads `(journal, field, suggested_value)` triples from named tabs; missing or unrecognized tabs are silently skipped; used by `run_enrichment.py` for remote deduplication
+- provides `read_csv_as_rows(csv_path)` and `upload_tab_from_csv(service, csv_path, tab_name)` — round-trip CSV helpers
+- provides `write_rows(service, spreadsheet_id, tab_name, rows)` — writes a list of rows to a tab
+from named tabs; missing or unrecognised tabs are silently skipped; used by `run_enrichment.py` for remote deduplication
 
-### agent/scripts/fetch_sheet.py
-
-Standalone utility for downloading any spreadsheet tab via the Sheets API.
-
-- downloads any tab by `--field` slug (e.g. `genetics_genomics`)
-- uses `sheets_client.get_sheets_service()` and `sheets_client.download_tab_as_csv()`
-- accepts optional `--output` and `--credentials` arguments
+Agent scripts (`gap_analysis.py`, `run_enrichment.py`, `upload_suggestions.py`) prepend `WhereToPublish.github.io/scripts/` to `sys.path` so they all import this single copy rather than maintaining a duplicate.
 
 ### agent/scripts/upload_suggestions.py
 
@@ -104,7 +99,9 @@ Upload script for staging suggestions in the Google Sheet.
 Shared constants and schemas.
 
 - defines output, log, and state paths
+- defines `WTP_SCRIPTS_DIR` pointing to `WhereToPublish.github.io/scripts/` (used by agent scripts to import the canonical `sheets_client`)
 - defines CSV headers and allowed values
+- defines `ALLOWED_FIELDS` including `"Alternative journal name"`, `"e-ISSN"`, `"p-ISSN"`, and `"ISSN-L"` alongside the standard metadata fields
 - defines `DEFAULT_MODEL` and `DEFAULT_PRIORITIES`
 - provides `slugify()` for session ids
 
@@ -114,9 +111,11 @@ Pipeline refresh and gap discovery across all Google Sheets tabs.
 
 - verifies that all 5 required external data files are present in `WhereToPublish.github.io/data_extraction/` (openapc.csv.gz, DOAJ.csv.gz, scimagojr.csv.gz, PCI_friendly.csv.gz, APC_dataverse.txt.gz); exits immediately with a clear, actionable error listing missing files if any are absent
 - does not download external data; those files are owned by the WhereToPublish project and populated via `bash scripts/download_extraction.sh` from inside that repo
-- downloads **all 10 Google Sheets tabs** (Generalists, Anatomy & Physiology, Cancer, Development, Ecology & Evolution, Genetics & Genomics, Immunology, Molecular & Cellular Biology, Neurosciences, Plants) via the Sheets API (using `sheets_client`) and writes each to `data_extracted/<slug>.csv`
+- downloads **all 10 Google Sheets tabs** (Generalists, Anatomy & Physiology, Cancer, Development, Ecology & Evolution, Genetics & Genomics, Immunology, Molecular & Cellular Biology, Neurosciences, Plants) via the Sheets API (using `WhereToPublish.github.io/scripts/sheets_client`) and writes each to `data_extracted/<slug>.csv`
 - runs the WTP pipeline (update_extracted.py → data_process.py) unless skipped
-- builds a unified gap report covering all tabs: each journal entry includes a `tab` field indicating its source; journals appearing in multiple tabs are deduplicated by name (first-seen tab wins)
+- builds a unified gap report covering all tabs: each journal entry includes a `tab` field indicating its source, as well as `e_issn`, `p_issn`, and `issn_l` fields populated from the enriched pipeline output; journals appearing in multiple tabs are deduplicated by name (first-seen tab wins)
+- generates gaps for `Alternative journal name` (high priority, `alt_name` type) when a journal has no Scimago data
+- generates low-priority `fill` gaps for `e-ISSN`, `p-ISSN`, and `ISSN-L` when those values are missing
 - writes `agent/output/gap_report.json`
 - records `wtp_dir` as `WhereToPublish.github.io` when run from the repo root
 - `--skip-download` skips all sheet tab downloads (external data verification always runs)
@@ -134,7 +133,7 @@ Current orchestrator.
 - supports `--journal` for exact single-journal targeting
 - supports `--journal-limit`, `--max-suggestions`, `--output`, `--state`, and `--log-dir`
 - gives each journal a unique OpenClaw session id
-- passes known metadata, requested gaps, and direct lookup URLs to the model
+- passes known metadata (including `e_issn`, `p_issn`, `issn_l`), requested gaps, and direct lookup URLs (including `doaj_by_issn` when an ISSN is known) to the model
 - tells the model to use tools, return JSON only, and stay within the provided existing-journal backlog
 - appends accepted rows and updates run state after each journal
 - writes checkpoint CSVs every 10 processed journals
@@ -157,10 +156,11 @@ Persistence and sanitization layer.
 - accepts only requested fields and supported schema values
 - rejects publisher-as-institution guesses
 - rejects institution types without a valid institution value
-- rejects `Scimago Journal Title` rows unless they are true `alt_name` suggestions
-- rejects `Scimago Journal Title` values that normalize to the original journal name
+- rejects `Alternative journal name` rows unless they are true `alt_name` suggestions
+- rejects `Alternative journal name` values that normalize to the original journal name
 - rejects `APC Euros = 0` for journals whose known business model is `Subscription` (a Subscription journal never has a zero APC in this schema; that value implies OA diamond)
 - rejects `APC Euros = 0` for any other journal unless the reasoning explicitly states there is no APC (e.g. "no APC", "free to publish", "does not charge")
+- rejects `e-ISSN`, `p-ISSN`, and `ISSN-L` values that do not match the `XXXX-XXXX` format (last character may be `X` as a check digit)
 - writes `run_state.json` and checkpoint CSVs
 - converts `status=ok` with zero valid rows into `unresolved`
 
@@ -172,11 +172,12 @@ Current emphasis:
 
 - one journal per session
 - use tools for research
-- start from caller-provided lookup URLs before relying on search
+- start from caller-provided lookup URLs (including `doaj_by_issn` when an ISSN is known) before relying on search
 - return one JSON object when the caller asks for JSON only
 - do not propose adding new journals
 - do not write files in the normal automation path
 - prefer unresolved over guesses when sources are blocked or ambiguous
+- `Alternative journal name` suggestions must use `suggestion_type: "alt_name"`; ISSN suggestions must be in `XXXX-XXXX` format
 
 Relevant files:
 

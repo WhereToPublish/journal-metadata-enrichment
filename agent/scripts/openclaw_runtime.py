@@ -108,7 +108,7 @@ class OpenClawRunner:
             parsed_payload=parsed_payload,
         )
 
-    def run(self, session_id: str, prompt: str, timeout_seconds: int = 240, max_attempts: int = 2) -> AgentRunResult:
+    def run(self, session_id: str, prompt: str, timeout_seconds: int = 3600, max_attempts: int = 2) -> AgentRunResult:
         retry_prompt = (
             prompt
             + "\n\nYour previous reply was invalid: you returned plain text instead of a JSON object. "

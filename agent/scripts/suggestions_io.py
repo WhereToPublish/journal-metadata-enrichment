@@ -2,24 +2,15 @@ from __future__ import annotations
 
 import csv
 import json
-from pathlib import Path
-import re
 from typing import Any
-
-from enrichment_common import (
-    ALLOWED_BUSINESS_MODELS,
-    ALLOWED_FIELDS,
-    ALLOWED_PRIORITIES,
-    ALLOWED_SUGGESTION_TYPES,
-    CSV_HEADERS,
-)
+from enrichment_common import *
 
 
 def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def _read_csv_rows(path: Path) -> tuple[bool, list[list[str]]]:
+def read_csv_rows(path: Path) -> tuple[bool, list[list[str]]]:
     if not path.exists():
         return False, []
     with open(path, encoding="utf-8", newline="") as handle:
@@ -30,10 +21,10 @@ def _read_csv_rows(path: Path) -> tuple[bool, list[list[str]]]:
     return has_header, rows[1:] if has_header else rows
 
 
-def _normalize_existing_csv(path: Path) -> None:
+def normalize_existing_csv(path: Path) -> None:
     if not path.exists():
         return
-    has_header, rows = _read_csv_rows(path)
+    has_header, rows = read_csv_rows(path)
     if has_header:
         return
     with open(path, "w", encoding="utf-8", newline="") as handle:
@@ -45,7 +36,7 @@ def _normalize_existing_csv(path: Path) -> None:
 def init_suggestions_csv(path: Path) -> None:
     ensure_parent(path)
     if path.exists():
-        _normalize_existing_csv(path)
+        normalize_existing_csv(path)
         return
     with open(path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -91,7 +82,7 @@ def write_checkpoint(csv_path: Path, checkpoint_path: Path) -> None:
     checkpoint_path.write_text(csv_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
-def _coerce_source_urls(raw_value: Any) -> list[str]:
+def coerce_source_urls(raw_value: Any) -> list[str]:
     if isinstance(raw_value, list):
         return [str(url).strip() for url in raw_value if str(url).strip()]
     if isinstance(raw_value, str) and raw_value.strip():
@@ -99,27 +90,27 @@ def _coerce_source_urls(raw_value: Any) -> list[str]:
     return []
 
 
-def _normalize_name(value: str) -> str:
+def normalize_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.strip().lower())
 
 
-def _names_equivalent_or_contained(left: str, right: str) -> bool:
-    normalized_left = _normalize_name(left)
-    normalized_right = _normalize_name(right)
+def names_equivalent_or_contained(left: str, right: str) -> bool:
+    normalized_left = normalize_name(left)
+    normalized_right = normalize_name(right)
     if not normalized_left or not normalized_right:
         return False
     return (
-        normalized_left == normalized_right
-        or normalized_left in normalized_right
-        or normalized_right in normalized_left
+            normalized_left == normalized_right
+            or normalized_left in normalized_right
+            or normalized_right in normalized_left
     )
 
 
 def sanitize_agent_result(
-    journal_name: str,
-    journal_gap: dict[str, Any],
-    agent_result: dict[str, Any] | None,
-    existing_keys: set[tuple[str, str, str]],
+        journal_name: str,
+        journal_gap: dict[str, Any],
+        agent_result: dict[str, Any] | None,
+        existing_keys: set[tuple[str, str, str]],
 ) -> tuple[str, list[dict[str, str]], str]:
     if not agent_result:
         return "error", [], "No JSON object could be parsed from the agent response."
@@ -161,7 +152,7 @@ def sanitize_agent_result(
                 continue
             suggested_value = digits
 
-        source_urls = _coerce_source_urls(item.get("source_urls", []))
+        source_urls = coerce_source_urls(item.get("source_urls", []))
         if not source_urls:
             continue
 
@@ -193,10 +184,15 @@ def sanitize_agent_result(
         suggested_value = row["suggested_value"]
         reasoning_lower = row["reasoning"].lower()
 
-        if field == "Scimago Journal Title":
+        if field == "Alternative journal name":
             if row["suggestion_type"] != "alt_name":
                 continue
-            if _normalize_name(suggested_value) == _normalize_name(journal_name):
+            if normalize_name(suggested_value) == normalize_name(journal_name):
+                continue
+
+        if field in ("e-ISSN", "p-ISSN", "ISSN-L"):
+            # ISSN must be formatted as XXXX-XXXX (last char may be X as check digit)
+            if not re.match(r"^\d{4}-[\dX][\dX][\dX][\dX]$", suggested_value):
                 continue
 
         if field == "APC Euros" and suggested_value == "0":
@@ -204,27 +200,27 @@ def sanitize_agent_result(
             if current_business_model == "Subscription":
                 continue
             if not any(
-                marker in reasoning_lower
-                for marker in (
-                    "no apc",
-                    "no article processing charge",
-                    "no article processing charges",
-                    "zero apc",
-                    "apc is 0",
-                    "free to publish",
-                    "no publication fee",
-                    "no charge",
-                    "does not charge",
-                    "without apc",
-                    "no article fee",
-                    "not charged",
-                    "waived",
-                )
+                    marker in reasoning_lower
+                    for marker in (
+                            "no apc",
+                            "no article processing charge",
+                            "no article processing charges",
+                            "zero apc",
+                            "apc is 0",
+                            "free to publish",
+                            "no publication fee",
+                            "no charge",
+                            "does not charge",
+                            "without apc",
+                            "no article fee",
+                            "not charged",
+                            "waived",
+                    )
             ):
                 continue
 
         if field == "Institution":
-            if current_publisher and _names_equivalent_or_contained(suggested_value, current_publisher):
+            if current_publisher and names_equivalent_or_contained(suggested_value, current_publisher):
                 continue
 
         filtered_rows.append(row)

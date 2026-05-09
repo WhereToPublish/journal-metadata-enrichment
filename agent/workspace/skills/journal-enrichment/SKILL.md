@@ -41,7 +41,10 @@ initial experiment target. Each row is one journal. Columns:
 | `Scimago Quartile` | string | Scimago | Format: "Q1 (Genetics; Molecular Biology)" |
 | `H index` | integer | Scimago | Scimago H-index. |
 | `PCI partner` | string | PCI list | "PCI friendly" or empty. Do not suggest changes to this field. |
-| `Scimago Journal Title` | string | **Manual (AI fills)** | **KEY FIELD.** The name under which this journal appears in Scimago. When empty AND the journal has no Scimago data, finding this name is the highest-impact action. |
+| `Alternative journal name` | string | **Manual (AI fills)** | **KEY FIELD.** The name under which this journal appears in Scimago (or DOAJ/OpenAPC when different). When empty AND the journal has no Scimago data, finding this name is the highest-impact action. |
+| `e-ISSN` | string | Scimago/DOAJ/OpenAPC | Electronic ISSN. Format: `XXXX-XXXX`. |
+| `p-ISSN` | string | Scimago/DOAJ/OpenAPC | Print ISSN. Format: `XXXX-XXXX`. |
+| `ISSN-L` | string | Scimago/DOAJ/OpenAPC | Linking ISSN. Format: `XXXX-XXXX`. |
 
 ### Business Model Exact Values (copy precisely)
 - `OA diamond` — fully open access, zero APC (APC Euros must be 0 or empty)
@@ -81,21 +84,21 @@ The pipeline matches journal names by normalizing them:
 **Why this matters for you**: When you search Scimago and find a journal under a slightly
 different name (e.g. "Journal of Genetics & Genomics" vs "Journal of Genetics and Genomics"),
 check if `norm_name()` would make them equal. If yes, the pipeline already handles it and no
-alt-name suggestion is needed. If no, the alt name IS needed in `Scimago Journal Title`.
+alt-name suggestion is needed. If no, the alt name IS needed in `Alternative journal name`.
 
 ### Two-Pass Join Strategy
 1. **First pass**: Match `Journal` (normalized) against Scimago/DOAJ/OpenAPC/Dataverse.
-2. **Second pass**: For unmatched journals, match `Scimago Journal Title` (normalized) against Scimago.
+2. **Second pass**: For unmatched journals, match `Alternative journal name` (normalized) against Scimago.
 
-Only the second pass uses `Scimago Journal Title`. If `Scimago Journal Title` is empty AND
+Only the second pass uses `Alternative journal name`. If `Alternative journal name` is empty AND
 the first pass fails (no Scimago rank), the journal gets no Scimago data at all.
 
 ### What external sources fill
 | Source | Fills |
 |--------|-------|
-| Scimago | Rank, Quartile, H index, Publisher (if empty), Business model (if empty) |
-| OpenAPC | APC Euros, Publisher (if empty), Business model (if empty) |
-| DOAJ | Publisher (if empty), Country, Website, Institution, APC Euros (if empty) |
+| Scimago | Rank, Quartile, H index, Publisher (if empty), Business model (if empty), e-ISSN, p-ISSN |
+| OpenAPC | APC Euros, Publisher (if empty), Business model (if empty), e-ISSN, p-ISSN, ISSN-L |
+| DOAJ | Publisher (if empty), Country, Website, Institution, APC Euros (if empty), e-ISSN, p-ISSN |
 | Dataverse | APC Euros (if empty), Publisher (if empty), Business model (if empty) |
 
 Fields the pipeline NEVER overwrites (always defer to manual curation):
@@ -107,7 +110,7 @@ Fields the pipeline NEVER overwrites (always defer to manual curation):
 
 ### Goal 1: Fill Empty Cells (Most Common)
 Journals still have empty cells after enrichment because:
-- The journal is not in Scimago/DOAJ under the same name → find the `Scimago Journal Title`
+- The journal is not in Scimago/DOAJ under the same name → find the `Alternative journal name`
 - The journal is genuinely new or niche → find the value directly from the publisher page
 
 For each missing field, attempt in this order:
@@ -145,10 +148,10 @@ Out of scope for this runtime:
 | L4 | CrossRef or other secondary source alone | 0.55–0.64 |
 | L5 | Single ambiguous or low-quality source | < 0.55 → SKIP |
 
-**For Scimago Journal Title suggestions specifically**:
-- If you find the exact journal title in Scimago after a name variation search: confidence = 0.85
-- If the Scimago result is clearly the same journal (same publisher, same field): add 0.05
-- If the Scimago result is ambiguous (common name): subtract 0.10
+**For Alternative journal name suggestions specifically**:
+- If you find the exact journal title in Scimago/DOAJ/OpenAPC after a name variation search: confidence = 0.85
+- If the result is clearly the same journal (same publisher, same field): add 0.05
+- If the result is ambiguous (common name): subtract 0.10
 
 **For new/niche journals without DOAJ entry**:
 - Publisher page alone is sufficient (L3 confidence = 0.65–0.79) — do not skip these
@@ -170,7 +173,7 @@ journal,field,current_value,suggested_value,confidence,source_urls,reasoning,sug
 | Column | Type | Description |
 |--------|------|-------------|
 | `journal` | string | Exact journal name as it appears in the Google Sheet |
-| `field` | string | Column to update (e.g. "Business model", "Scimago Journal Title") |
+| `field` | string | Column to update (e.g. "Business model", "Alternative journal name") |
 | `current_value` | string | Current value in the sheet (empty string if null/missing) |
 | `suggested_value` | string | Proposed new value |
 | `confidence` | float | 0.00–1.00 |
@@ -181,14 +184,14 @@ journal,field,current_value,suggested_value,confidence,source_urls,reasoning,sug
 
 ### suggestion_type Values
 - `fill` — adding a value to an empty field
-- `alt_name` — providing/correcting the `Scimago Journal Title` to fix a failed pipeline join
+- `alt_name` — providing/correcting the `Alternative journal name` to fix a failed pipeline join
 - `correct` — changing an existing (wrong) value
 - `remove` — flag a journal for removal (non-existent)
 
 ### Priority Rules
-- `high`: Business model, Publisher, Scimago Journal Title (when missing Scimago data)
+- `high`: Business model, Publisher, Alternative journal name (when missing Scimago data)
 - `medium`: Country, Website, APC Euros, Publisher type
-- `low`: Institution, Institution type
+- `low`: Institution, Institution type, e-ISSN, p-ISSN, ISSN-L
 
 ### Example Row
 ```
@@ -226,7 +229,6 @@ START
 ---
 
 ## 7. Key Do-Nots
-- Do NOT use ISSN — this database has no ISSN column.
 - Do NOT modify WhereToPublish.github.io/ files directly.
 - Do NOT write to the Google Sheet.
 - Do NOT write to `AI_suggestions.csv` directly in automated one-journal runs.
@@ -235,12 +237,13 @@ START
 - Do NOT schedule runs — this is manual-start only.
 - Do NOT suggest more than ~50 items per session.
 - Do NOT skip HIGH priority gaps to do LOW priority ones.
+- `e-ISSN`, `p-ISSN`, and `ISSN-L` values must follow the `XXXX-XXXX` format (last char may be `X`). Do not suggest malformed ISSNs.
 
 ---
 
 ## 8. Useful URLs for Research
 - DOAJ search: `https://doaj.org/search/journals/<JOURNAL_NAME>`
-- DOAJ journal page: `https://doaj.org/toc/<ISSN>` (if ISSN known from DOAJ search)
+- DOAJ by ISSN: `https://doaj.org/toc/<ISSN>` (use `e_issn` or `p_issn` from `known_metadata` when available)
 - Scimago search: `https://www.scimagojr.com/journalsearch.php?q=<JOURNAL_NAME>`
 - CrossRef search: `https://search.crossref.org/?q=<JOURNAL_NAME>&from_ui=yes`
 - NLM catalog: `https://www.ncbi.nlm.nih.gov/nlmcatalog/?term=<JOURNAL_NAME>`
