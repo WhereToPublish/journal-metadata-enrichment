@@ -67,6 +67,8 @@ echo
 
 "$VENV_PYTHON" agent/scripts/run_enrichment.py "$@" 2>&1 | tee "$RUNNER_LOG"
 
+openclaw gateway stop
+
 echo
 echo "Run finished."
 echo "Runner log  : $RUNNER_LOG"

@@ -106,12 +106,8 @@ def names_equivalent_or_contained(left: str, right: str) -> bool:
     )
 
 
-def sanitize_agent_result(
-        journal_name: str,
-        journal_gap: dict[str, Any],
-        agent_result: dict[str, Any] | None,
-        existing_keys: set[tuple[str, str, str]],
-) -> tuple[str, list[dict[str, str]], str]:
+def sanitize_agent_result(journal_name: str, journal_gap: dict[str, Any], agent_result: dict[str, Any] | None,
+                          existing_keys: set[tuple[str, str, str]]) -> tuple[str, list[dict[str, str]], str]:
     if not agent_result:
         return "error", [], "No JSON object could be parsed from the agent response."
 
@@ -186,6 +182,9 @@ def sanitize_agent_result(
 
         if field == "Alternative journal name":
             if row["suggestion_type"] != "alt_name":
+                continue
+            # Require higher confidence for alt_name — a wrong name actively breaks the pipeline join.
+            if float(row["confidence"]) < 0.70:
                 continue
             if normalize_name(suggested_value) == normalize_name(journal_name):
                 continue

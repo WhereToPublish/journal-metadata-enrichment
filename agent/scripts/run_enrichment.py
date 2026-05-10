@@ -99,6 +99,8 @@ def build_prompt(journal_gap: dict[str, Any]) -> str:
     issn_l = journal_gap.get("issn_l", "")
     # Use the most useful ISSN for a DOAJ direct lookup (e-ISSN preferred, then p-ISSN, then ISSN-L)
     doaj_issn = e_issn or p_issn or issn_l
+    # Use the most useful ISSN for Scimago direct lookup (same preference order)
+    scimago_issn = e_issn or p_issn or issn_l
     payload = {
         "journal": journal_gap["name"],
         "known_metadata": {
@@ -114,10 +116,12 @@ def build_prompt(journal_gap: dict[str, Any]) -> str:
             "doaj_search": f"https://doaj.org/search/journals/{encoded_name}",
             "doaj_by_issn": f"https://doaj.org/toc/{doaj_issn}" if doaj_issn else "",
             "scimago_search": f"https://www.scimagojr.com/journalsearch.php?q={encoded_name}&tip=jou",
+            "scimago_by_issn": f"https://www.scimagojr.com/journalsearch.php?q={scimago_issn}&tip=issn" if scimago_issn else "",
         },
         "requested_gaps": journal_gap["gaps"],
     }
     current_business_model = journal_gap.get("current_business_model", "")
+    has_issn = bool(journal_gap.get("e_issn") or journal_gap.get("p_issn") or journal_gap.get("issn_l"))
     return (
             "Research exactly one journal.\n"
             "Use the available tools in this run, including web search and page fetch tools, to gather evidence.\n"
@@ -129,18 +133,36 @@ def build_prompt(journal_gap: dict[str, Any]) -> str:
             "Only suggest values for the requested gaps. Do not include any suggestion whose suggested_value is empty.\n"
             "If a requested field cannot be supported by reliable evidence after a few attempts, leave it unresolved instead of guessing.\n"
             "Use these business model values only: OA diamond, OA, Hybrid, Subscription.\n"
+            "Business model REQUIRES hard evidence: you must find explicit text on the journal page or DOAJ confirming the model "
+            "(e.g. 'This journal is open access', 'Subscription only', 'APC: $X'). "
+            "Do NOT infer the business model from the publisher's reputation or general knowledge. "
+            "If the journal page and DOAJ do not explicitly confirm the business model, leave it unresolved.\n"
             "Institution type must be a category label, never the institution name itself.\n"
             "Use only these institution type labels when supported by the evidence: Society, Society/Association, University, Research Institute.\n"
             "Do not infer Institution or Institution type from a commercial publisher name alone. If the source only identifies a publisher and not a sponsoring institution, leave Institution and Institution type unresolved.\n"
             "Do not use a publisher company name as Institution or Institution type unless the evidence explicitly identifies it as the institution.\n"
             "APC Euros must be a plain integer string with no currency symbol.\n"
-            "Never output APC Euros as 0 unless the evidence explicitly states that there is no APC or that the APC is zero (e.g. 'no APC', 'free to publish', 'APC is 0').\n"
+            "A website that does not mention APCs is NOT evidence that APC = 0. Absence of mention means the source is insufficient — leave APC Euros unresolved.\n"
+            "Only suggest APC Euros = 0 when the source explicitly states there is no charge (e.g. 'no APC', 'free to publish', 'APC is 0', 'does not charge').\n"
+            "If an APC is listed in a non-Euro currency (GBP, USD, etc.), convert it using approximate current exchange rates, or leave it unresolved if uncertain.\n"
             + (
                 "The known business model for this journal is 'Subscription'. Do NOT suggest APC Euros = 0 for a Subscription journal.\n"
                 if current_business_model == "Subscription"
                 else ""
             )
             + "For the Alternative journal name field, always use suggestion_type 'alt_name', never 'fill', even when the current value is empty.\n"
+            + (
+                "An ISSN is available for this journal. To find the Alternative journal name: "
+                "first fetch lookup_urls.scimago_by_issn (Scimago search by ISSN) — the result title is the exact Scimago name. "
+                "Also try lookup_urls.doaj_by_issn. "
+                "Do NOT infer the Alternative journal name from topic keywords — only use names you find in Scimago or DOAJ.\n"
+                if has_issn
+                else
+                "No ISSN is available. To find the Alternative journal name: search Scimago and DOAJ by journal name. "
+                "Only suggest a name if you find an unambiguous match (same publisher, same scope). "
+                "Do NOT infer from topic keywords.\n"
+            )
+            + "Alternative journal name suggestions require confidence >= 0.70; suggestions below that threshold will be rejected.\n"
               "Each suggestion must have confidence between 0 and 1, and you should only return suggestions with confidence >= 0.55.\n"
               "You MUST always return a single JSON object, even if all sources are blocked or unavailable. "
               "If the evidence is insufficient for all requested gaps, return: "

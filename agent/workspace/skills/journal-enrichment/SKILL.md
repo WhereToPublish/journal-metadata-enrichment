@@ -119,6 +119,22 @@ For each missing field, attempt in this order:
 3. Check Scimago (for rank/quartile, and to discover the alt name)
 4. Check CrossRef (for publisher info)
 
+#### Finding the Alternative journal name
+`Alternative journal name` is the **highest-priority gap** — getting this right unlocks Scimago rank, quartile, and H-index for the journal.
+
+Search strategy when an ISSN is available (check `known_metadata.e_issn`, `p_issn`, or `issn_l`):
+1. **Use `lookup_urls.scimago_by_issn`** — this fetches Scimago filtered by ISSN. The result title is the exact Scimago name for this journal.
+2. If `scimago_by_issn` returns no result, try `lookup_urls.doaj_by_issn` — DOAJ shows the canonical journal title.
+3. Use the exact title returned by these sources as the `Alternative journal name`.
+
+Search strategy without an ISSN:
+1. Fetch `lookup_urls.scimago_search` and look for an unambiguous match (same publisher, same scope).
+2. Only suggest the alt_name if you are confident it is the same journal — topic similarity alone is NOT sufficient.
+3. If no unambiguous match, return unresolved for this field.
+
+**Do NOT infer an `Alternative journal name` from topic keywords or by combining subject terms.** Only suggest a name that explicitly appears in Scimago or DOAJ for this journal.
+Note: a `confidence` below 0.70 for `Alternative journal name` will be rejected by the pipeline even if it is syntactically valid — aim for ≥ 0.75 when the source explicitly names the journal, or return unresolved.
+
 ### Goal 2: Correct Errors
 Signs of an error:
 - Business model says "Subscription" but DOAJ lists the journal as fully OA
@@ -147,6 +163,14 @@ Out of scope for this runtime:
 | L3 | Scimago confirms OR publisher page alone (no DOAJ entry) | 0.65–0.79 |
 | L4 | CrossRef or other secondary source alone | 0.55–0.64 |
 | L5 | Single ambiguous or low-quality source | < 0.55 → SKIP |
+
+### Business model — publisher reputation is L5 (SKIP)
+If your only evidence for a Business model is "Publisher X is known for subscription journals" or similar reputation-based reasoning, that is **L5 — below the confidence threshold, do not suggest it**.
+Business model requires explicit text on the journal page or DOAJ: e.g. "This journal requires an APC of…", "Fully open access", "Subscription journal", or equivalent.
+
+### APC Euros — absence of mention is not evidence
+If a journal page does not mention APCs, that is **not** evidence of zero APC. The page may simply not surface that information. Only suggest `APC Euros = 0` when the source explicitly states there is no charge ("no APC", "free to publish", "does not charge", etc.).
+Never use currency conversion rates that are clearly wrong (e.g. 1:1 GBP→EUR). Use approximate current rates or leave APC Euros unresolved if the APC is not in Euros.
 
 **For Alternative journal name suggestions specifically**:
 - If you find the exact journal title in Scimago/DOAJ/OpenAPC after a name variation search: confidence = 0.85
@@ -244,7 +268,8 @@ START
 ## 8. Useful URLs for Research
 - DOAJ search: `https://doaj.org/search/journals/<JOURNAL_NAME>`
 - DOAJ by ISSN: `https://doaj.org/toc/<ISSN>` (use `e_issn` or `p_issn` from `known_metadata` when available)
-- Scimago search: `https://www.scimagojr.com/journalsearch.php?q=<JOURNAL_NAME>`
+- Scimago search by name: `https://www.scimagojr.com/journalsearch.php?q=<JOURNAL_NAME>&tip=jou`
+- Scimago search by ISSN: `https://www.scimagojr.com/journalsearch.php?q=<ISSN>&tip=issn` (preferred when ISSN is known)
 - CrossRef search: `https://search.crossref.org/?q=<JOURNAL_NAME>&from_ui=yes`
 - NLM catalog: `https://www.ncbi.nlm.nih.gov/nlmcatalog/?term=<JOURNAL_NAME>`
 

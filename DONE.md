@@ -13,7 +13,7 @@ run_agent.sh
     -> WhereToPublish.github.io/scripts/sheets_client.py — downloads all 10 sheet tabs
     -> WhereToPublish pipeline (update_extracted.py → data_process.py)
   -> agent/scripts/run_enrichment.py
-    -> WhereToPublish.github.io/scripts/sheets_client.load_suggestion_keys_from_tabs() — loads remote deduplication keys
+    -> load_suggestion_keys_from_tabs() — loads remote deduplication keys
     -> agent/scripts/openclaw_runtime.py
     -> one OpenClaw session per journal
     -> agent/scripts/suggestions_io.py
@@ -80,7 +80,6 @@ Shared Google Sheets API module — canonical implementation used by both the WT
 - provides `download_tab_as_csv(service, tab_name, dest_path)` — downloads a tab and writes it as CSV
 - provides `read_csv_as_rows(csv_path)` and `upload_tab_from_csv(service, csv_path, tab_name)` — round-trip CSV helpers
 - provides `write_rows(service, spreadsheet_id, tab_name, rows)` — writes a list of rows to a tab
-from named tabs; missing or unrecognised tabs are silently skipped; used by `run_enrichment.py` for remote deduplication
 
 Agent scripts (`gap_analysis.py`, `run_enrichment.py`, `upload_suggestions.py`) prepend `WhereToPublish.github.io/scripts/` to `sys.path` so they all import this single copy rather than maintaining a duplicate.
 
@@ -114,8 +113,8 @@ Pipeline refresh and gap discovery across all Google Sheets tabs.
 - downloads **all 10 Google Sheets tabs** (Generalists, Anatomy & Physiology, Cancer, Development, Ecology & Evolution, Genetics & Genomics, Immunology, Molecular & Cellular Biology, Neurosciences, Plants) via the Sheets API (using `WhereToPublish.github.io/scripts/sheets_client`) and writes each to `data_extracted/<slug>.csv`
 - runs the WTP pipeline (update_extracted.py → data_process.py) unless skipped
 - builds a unified gap report covering all tabs: each journal entry includes a `tab` field indicating its source, as well as `e_issn`, `p_issn`, and `issn_l` fields populated from the enriched pipeline output; journals appearing in multiple tabs are deduplicated by name (first-seen tab wins)
-- generates gaps for `Alternative journal name` (high priority, `alt_name` type) when a journal has no Scimago data
-- generates low-priority `fill` gaps for `e-ISSN`, `p-ISSN`, and `ISSN-L` when those values are missing
+- generates gaps for `Alternative journal name` (highest priority weight = 12, `alt_name` type) when a journal has no Scimago data
+- generates low-priority `fill` gaps for `e-ISSN`, `p-ISSN`, and `ISSN-L` **only when the journal has none of the three ISSN fields** — if any ISSN is already present (`e-ISSN`, `p-ISSN`, or `ISSN-L`), all three ISSN gap entries are suppressed
 - writes `agent/output/gap_report.json`
 - records `wtp_dir` as `WhereToPublish.github.io` when run from the repo root
 - `--skip-download` skips all sheet tab downloads (external data verification always runs)
@@ -133,10 +132,14 @@ Current orchestrator.
 - supports `--journal` for exact single-journal targeting
 - supports `--journal-limit`, `--max-suggestions`, `--output`, `--state`, and `--log-dir`
 - gives each journal a unique OpenClaw session id
-- passes known metadata (including `e_issn`, `p_issn`, `issn_l`), requested gaps, and direct lookup URLs (including `doaj_by_issn` when an ISSN is known) to the model
+- passes known metadata (including `e_issn`, `p_issn`, `issn_l`), requested gaps, and direct lookup URLs to the model; when any ISSN is known the prompt includes `scimago_by_issn` (Scimago search by ISSN) and `doaj_by_issn` as the preferred sources for resolving `Alternative journal name`
 - tells the model to use tools, return JSON only, and stay within the provided existing-journal backlog
+- instructs the model that **Business model requires hard evidence** (explicit text on the journal page or DOAJ) and that inference from publisher reputation is not acceptable
+- instructs the model that **absence of APC mention is not evidence** that APC = 0; only suggest APC Euros = 0 when the source explicitly states no charge
+- instructs the model to convert non-Euro APC values using approximate current exchange rates
 - appends accepted rows and updates run state after each journal
 - writes checkpoint CSVs every 10 processed journals
+- provides `load_suggestion_keys_from_tabs(service, tab_names, spreadsheet_id)` — returns a set of `(journal, field, suggested_value)` triples read from the given sheet tabs; missing or unrecognised tabs are silently skipped; 
 
 ### agent/scripts/openclaw_runtime.py
 
@@ -145,7 +148,7 @@ Headless OpenClaw wrapper.
 - runs `openclaw agent --session-id ... --message ... --thinking off --json`
 - writes prompt, stdout JSON, and stderr logs per journal session
 - extracts the model JSON object from the returned payload text
-- retries once with a narrower repair prompt when the model returns non-JSON output
+- retries once when the model returns non-JSON output; the retry uses a **compact prompt** (full instructions stripped, only a short JSON-only directive + the Evidence JSON block retained) to prevent context overflow from compounding across attempts
 
 ### agent/scripts/suggestions_io.py
 
@@ -158,6 +161,7 @@ Persistence and sanitization layer.
 - rejects institution types without a valid institution value
 - rejects `Alternative journal name` rows unless they are true `alt_name` suggestions
 - rejects `Alternative journal name` values that normalize to the original journal name
+- rejects `Alternative journal name` suggestions with confidence < 0.70 (a wrong alt_name would silently break the Scimago join)
 - rejects `APC Euros = 0` for journals whose known business model is `Subscription` (a Subscription journal never has a zero APC in this schema; that value implies OA diamond)
 - rejects `APC Euros = 0` for any other journal unless the reasoning explicitly states there is no APC (e.g. "no APC", "free to publish", "does not charge")
 - rejects `e-ISSN`, `p-ISSN`, and `ISSN-L` values that do not match the `XXXX-XXXX` format (last character may be `X` as a check digit)

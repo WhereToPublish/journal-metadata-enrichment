@@ -4,10 +4,7 @@ google_service_account.json
 credentials*.json
 
 # Agent-generated outputs — not versioned
-agent/output/*.csv
-agent/output/*.json
-agent/output/logs/
-agent/output/state/
+agent/output/
 
 # Python
 __pycache__/

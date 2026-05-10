@@ -177,7 +177,14 @@ def compute_gaps(raw_row: dict, enriched_row: dict | None) -> list[dict]:
     gaps = []
     row = enriched_row if enriched_row else raw_row
 
+    # If the journal already has at least one ISSN (from any source), skip all ISSN gaps.
+    # The pipeline join can often recover the remaining ISSNs once one is known.
+    issn_fields = {"e-ISSN", "p-ISSN", "ISSN-L"}
+    any_issn_present = any(not is_empty(row.get(f, "")) for f in issn_fields)
+
     for field, (priority, weight) in FIELD_PRIORITIES.items():
+        if field in issn_fields and any_issn_present:
+            continue
         if is_empty(row.get(field, "")):
             gaps.append({
                 "field": field,
@@ -187,7 +194,8 @@ def compute_gaps(raw_row: dict, enriched_row: dict | None) -> list[dict]:
                 "priority_weight": weight,
             })
 
-    # Detect journals with no Scimago match — prime candidates for alt_name suggestion
+    # Detect journals with no Scimago match — prime candidates for alt_name suggestion.
+    # This gets the highest priority_weight (12) so it is processed before Business model (10).
     if is_empty(row.get("Scimago Rank", "")) and is_empty(row.get("Scimago Quartile", "")):
         alt_journal_name = raw_row.get("Alternative journal name", "")
         gaps.append({
@@ -195,7 +203,7 @@ def compute_gaps(raw_row: dict, enriched_row: dict | None) -> list[dict]:
             "current_value": alt_journal_name if not is_empty(alt_journal_name) else "",
             "gap_type": "alt_name",
             "priority": "high",
-            "priority_weight": 8,
+            "priority_weight": 12,
             "note": (
                 "Journal has no Scimago data. Providing the correct alternative journal name "
                 "enables automatic enrichment with Rank, Quartile, H index, and Publisher."

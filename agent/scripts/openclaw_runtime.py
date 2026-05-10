@@ -109,14 +109,30 @@ class OpenClawRunner:
         )
 
     def run(self, session_id: str, prompt: str, timeout_seconds: int = 3600, max_attempts: int = 2) -> AgentRunResult:
+        # Build a compact retry prompt: strip the long instruction block from the original
+        # prompt and keep only the Evidence JSON + a minimal schema instruction.
+        # A full-size retry is strictly worse when the first attempt failed due to context overflow.
+        evidence_marker = "\nEvidence:\n"
+        evidence_start = prompt.rfind(evidence_marker)
+        evidence_block = prompt[evidence_start:] if evidence_start != -1 else prompt
         retry_prompt = (
-            prompt
-            + "\n\nYour previous reply was invalid: you returned plain text instead of a JSON object. "
-            + "You MUST return exactly one JSON object and nothing else. "
-            + "Even if all sources are blocked or unavailable, return a valid JSON object like this:\n"
-            + '{"journal": "<journal name>", "suggestions": [], "status": "unresolved", "notes": "<brief reason>"}\n'
-            + "Do not include any text before or after the JSON object."
+            "You must return exactly one JSON object and nothing else.\n"
+            "Do not fetch any additional URLs. Do not explain your reasoning outside the JSON.\n"
+            "If you could not find reliable evidence for a field, omit that field from suggestions.\n"
+            "If no field has reliable evidence, return: "
+            '{"journal": "<name>", "suggestions": [], "status": "unresolved", "notes": "<brief reason>"}\n\n'
+            "JSON schema (return this exact shape):\n"
+            "{\n"
+            '  "journal": string,\n'
+            '  "suggestions": [{"field": string, "current_value": string, "suggested_value": string, '
+            '"confidence": number, "source_urls": string[], "reasoning": string, '
+            '"suggestion_type": string, "priority": string}],\n'
+            '  "status": "ok" | "unresolved",\n'
+            '  "notes": string\n'
+            "}\n"
+            + evidence_block
         )
+
         result: AgentRunResult | None = None
         for attempt in range(1, max_attempts + 1):
             attempt_session_id = session_id if attempt == 1 else f"{session_id}-retry{attempt - 1}"
