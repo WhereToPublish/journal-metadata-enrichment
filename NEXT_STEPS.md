@@ -1,6 +1,6 @@
 # NEXT_STEPS.md — Using Suggestion History to Improve the AI Agent
 
-The `AI_suggestions_processed` sheet accumulates every suggestion that has been reviewed
+The `Agent_suggestions_processed` sheet accumulates every suggestion that has been reviewed
 (status `approve` or `reject`).  Over time this dataset becomes a labelled history of agent
 performance that can be used for analysis and systematic improvement.
 
@@ -10,7 +10,7 @@ performance that can be used for analysis and systematic improvement.
 
 **Goal**: Identify which suggestion fields the model performs well on and which it does not.
 
-- Export `AI_suggestions_processed` to CSV.
+- Export `Agent_suggestions_processed` to CSV.
 - Group rows by `field` and compute:
   - `approve_rate = approve / (approve + reject)` per field
   - median `confidence` for approved vs rejected rows
@@ -103,7 +103,7 @@ Once the history is large enough (≥ 500 reviewed suggestions across fields):
 
 Implement a script `agent/scripts/report_performance.py` that:
 
-1. Reads `AI_suggestions_processed` from Google Sheets (using `sheets_client`).
+1. Reads `Agent_suggestions_processed` from Google Sheets (using `sheets_client`).
 2. Computes per-field approval rates, overall approval rate, and top rejection reasons.
 3. Writes a Markdown report to `agent/output/performance_report.md`.
 4. Optionally prints a summary to stdout for CI/CD pipelines.
@@ -123,5 +123,5 @@ To enable the analyses above, add the following columns when they are missing:
 | `reviewed_at`   | processed tab  | Timestamp when the row was approved/rejected|
 | `reviewer`      | processed tab  | Optional: who reviewed (for team workflows) |
 
-These columns do not need to be in the local `AI_suggestions.csv`; they can be written by the
+These columns do not need to be in the local `Agent_suggestions.csv`; they can be written by the
 Apps Script or added manually in Google Sheets.

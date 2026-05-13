@@ -1,13 +1,13 @@
-"""upload_suggestions.py — Upload AI_suggestions.csv to the WhereToPublish Google Sheet.
+"""upload_suggestions.py — Upload Agent_suggestions.csv to the WhereToPublish Google Sheet.
 
-Reads AI_suggestions.csv and writes all rows to the 'AI_suggestions' tab of the
+Reads Agent_suggestions.csv and writes all rows to the 'Agent_suggestions' tab of the
 spreadsheet. A leading 'Status' column (pending / approve / reject) is prepended for
 human review. New suggestions are uploaded with 'pending' status.
 Any existing content in that tab is replaced on each run.
 
 Usage:
     python3 agent/scripts/upload_suggestions.py \
-        [--input agent/output/AI_suggestions.csv] \
+        [--input agent/output/Agent_suggestions.csv] \
         [--credentials ~/.config/wheretopublish/google_service_account.json]
 """
 
@@ -27,9 +27,9 @@ if str(WTP_SCRIPTS) not in sys.path:
 import sheets_client
 from enrichment_common import SUGGESTIONS_CSV_PATH
 
-SUGGESTIONS_TAB = "AI_suggestions"
+SUGGESTIONS_TAB = "Agent_suggestions"
 
-# Column order in the AI_suggestions tab (Status is first; the rest match CSV headers)
+# Column order in the Agent_suggestions tab (Status is first; the rest match CSV headers)
 OUTPUT_HEADERS = [
     "Status",
     "journal",
@@ -101,13 +101,13 @@ def upload(input_csv: Path, credentials_path: Path | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Upload AI_suggestions.csv to the WhereToPublish Google Sheet."
+        description="Upload Agent_suggestions.csv to the WhereToPublish Google Sheet."
     )
     parser.add_argument(
         "--input",
         type=Path,
         default=SUGGESTIONS_CSV_PATH,
-        help=f"Path to AI_suggestions.csv (default: {SUGGESTIONS_CSV_PATH})",
+        help=f"Path to Agent_suggestions.csv (default: {SUGGESTIONS_CSV_PATH})",
     )
     parser.add_argument(
         "--credentials",

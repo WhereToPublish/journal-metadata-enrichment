@@ -20,7 +20,7 @@ run_agent.sh
   -> agent/output/*
 
 agent/scripts/upload_suggestions.py  (run manually after enrichment)
-  -> WhereToPublish.github.io/scripts/sheets_client.py — writes AI_suggestions tab with Status dropdown
+  -> WhereToPublish.github.io/scripts/sheets_client.py — writes Agent_suggestions tab with Status dropdown
 ```
 
 Key runtime properties:
@@ -32,7 +32,7 @@ Key runtime properties:
 - the agent works only on journals already present in the selected backlog
 - Python owns CSV, state, checkpoint, and log persistence
 - unresolved is the normal fallback when evidence is weak or blocked
-- before each enrichment run, remote suggestion keys are loaded from `AI_suggestions` and `AI_suggestions_processed`; if loading fails the run degrades gracefully to local-CSV deduplication only
+- before each enrichment run, remote suggestion keys are loaded from `Agent_suggestions` and `Agent_suggestions_processed`; if loading fails the run degrades gracefully to local-CSV deduplication only
 - Google Sheets API (service-account auth) is used for all spreadsheet I/O: downloading tabs, uploading suggestions, and loading remote deduplication keys
 
 ## Root Files
@@ -87,8 +87,8 @@ Agent scripts (`gap_analysis.py`, `run_enrichment.py`, `upload_suggestions.py`) 
 
 Upload script for staging suggestions in the Google Sheet.
 
-- reads `AI_suggestions.csv` (default: `agent/output/AI_suggestions.csv`)
-- creates or reuses the `AI_suggestions` tab in the spreadsheet
+- reads `Agent_suggestions.csv` (default: `agent/output/Agent_suggestions.csv`)
+- creates or reuses the `Agent_suggestions` tab in the spreadsheet
 - clears existing content and writes a fresh header + data rows
 - prepends a `Status` column (pending / approve / reject); new rows are always uploaded as `pending`
 - accepts optional `--input` and `--credentials` arguments
@@ -110,7 +110,7 @@ Pipeline refresh and gap discovery across all Google Sheets tabs.
 
 - verifies that all 5 required external data files are present in `WhereToPublish.github.io/data_extraction/` (openapc.csv.gz, DOAJ.csv.gz, scimagojr.csv.gz, PCI_friendly.csv.gz, APC_dataverse.txt.gz); exits immediately with a clear, actionable error listing missing files if any are absent
 - does not download external data; those files are owned by the WhereToPublish project and populated via `bash scripts/download_extraction.sh` from inside that repo
-- downloads **all 10 Google Sheets tabs** (Generalists, Anatomy & Physiology, Cancer, Development, Ecology & Evolution, Genetics & Genomics, Immunology, Molecular & Cellular Biology, Neurosciences, Plants) via the Sheets API (using `WhereToPublish.github.io/scripts/sheets_client`) and writes each to `data_extracted/<slug>.csv`
+- downloads **all 10 Google Sheets tabs** (Generalist, Anatomy & Physiology, Cancer, Development, Ecology & Evolution, Genetics & Genomics, Immunology, Molecular & Cellular Biology, Neurosciences, Plants) via the Sheets API (using `WhereToPublish.github.io/scripts/sheets_client`) and writes each to `data_extracted/<slug>.csv`
 - runs the WTP pipeline (update_extracted.py → data_process.py) unless skipped
 - builds a unified gap report covering all tabs: each journal entry includes a `tab` field indicating its source, as well as `e_issn`, `p_issn`, and `issn_l` fields populated from the enriched pipeline output; journals appearing in multiple tabs are deduplicated by name (first-seen tab wins)
 - generates gaps for `Alternative journal name` (highest priority weight = 12, `alt_name` type) when a journal has no Scimago data
@@ -125,7 +125,7 @@ Pipeline refresh and gap discovery across all Google Sheets tabs.
 Current orchestrator.
 
 - can run gap analysis unless `--skip-gap-analysis` is passed
-- loads remote deduplication keys from `AI_suggestions` and `AI_suggestions_processed` Google Sheets tabs before processing any journal; if remote loading fails, logs a warning and falls back to local-CSV deduplication only
+- loads remote deduplication keys from `Agent_suggestions` and `Agent_suggestions_processed` Google Sheets tabs before processing any journal; if remote loading fails, logs a warning and falls back to local-CSV deduplication only
 - merges remote keys with local `existing_keys` so any suggestion already present in either sheet is silently dropped before persistence
 - accepts optional `--credentials` argument forwarded to the remote key loader
 - loads the gap report and selects journals by priority
@@ -154,7 +154,7 @@ Headless OpenClaw wrapper.
 
 Persistence and sanitization layer.
 
-- initializes and normalizes `AI_suggestions.csv`
+- initializes and normalizes `Agent_suggestions.csv`
 - deduplicates on `(journal, field, suggested_value)`
 - accepts only requested fields and supported schema values
 - rejects publisher-as-institution guesses
@@ -193,16 +193,16 @@ Relevant files:
 
 ## Review Workflow
 
-The `AI_suggestions` Google Sheets tab is the staging area for human review.
+The `Agent_suggestions` Google Sheets tab is the staging area for human review.
 
 - each row has a `Status` column (pending / approve / reject)
 - new rows are always uploaded as `pending`
 - team members set the status to `approve` or `reject` after reviewing evidence
 - running **WhereToPublish → Apply Reviewed Suggestions** (Apps Script):
-  - `approve` rows: the suggestion is written to the appropriate data tab, then the row is archived in `AI_suggestions_processed`
-  - `reject` rows: the row is archived in `AI_suggestions_processed` without any data change
+  - `approve` rows: the suggestion is written to the appropriate data tab, then the row is archived in `Agent_suggestions_processed`
+  - `reject` rows: the row is archived in `Agent_suggestions_processed` without any data change
   - `pending` rows are left untouched
-- the `AI_suggestions_processed` tab accumulates all reviewed suggestions for performance analysis (see `NEXT_STEPS.md`)
+- the `Agent_suggestions_processed` tab accumulates all reviewed suggestions for performance analysis (see `NEXT_STEPS.md`)
 
 ## Persistence Contract
 
@@ -224,7 +224,7 @@ The effective contract between Python and the model is:
 
 Default output files:
 
-- `agent/output/AI_suggestions.csv`
+- `agent/output/Agent_suggestions.csv`
 - `agent/output/gap_report.json`
 - `agent/output/state/run_state.json`
 

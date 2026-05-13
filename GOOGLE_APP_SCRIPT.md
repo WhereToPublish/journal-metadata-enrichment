@@ -7,7 +7,7 @@ review workflow.
 
 ### 1. What the Tab Looks Like
 
-After upload, the `AI_suggestions` tab has these columns:
+After upload, the `Agent_suggestions` tab has these columns:
 
 | A       | B              | C              | D             | E               | F          | G           | H         | I               | J        |
 | ------- | -------------- | -------------- | ------------- | --------------- | ---------- | ----------- | --------- | --------------- | -------- |
@@ -28,20 +28,20 @@ The **Status** column is a dropdown with three options: `pending`, `approve`, `r
 
 ```javascript
 // ApplySuggestions.gs
-// Processes reviewed suggestions from the AI_suggestions tab:
+// Processes reviewed suggestions from the Agent_suggestions tab:
 //   - "approve" → applies the suggestion to the corresponding data tab + archives
 //   - "reject"  → archives only (no data change)
 //   - "pending" → left untouched
 //
 // Run via: Extensions > WhereToPublish > Apply Reviewed Suggestions
 
-const SUGGESTIONS_TAB = "AI_suggestions";
-const PROCESSED_TAB   = "AI_suggestions_processed";
+const SUGGESTIONS_TAB = "Agent_suggestions";
+const PROCESSED_TAB   = "Agent_suggestions_processed";
 
 // Map tab field values to the actual Google Sheets tab names.
 // Must match the tab names used in the spreadsheet exactly.
 const FIELD_TO_TAB = {
-  "Generalist":                   "Generalists",
+  "Generalist":                   "Generalist",
   "Anatomy & Physiology":         "Anatomy & Physiology",
   "Cancer":                       "Cancer",
   "Development":                  "Development",
@@ -93,7 +93,7 @@ function applyReviewedSuggestions() {
   let applied = 0;
   let archived = 0;
   const errors = [];
-  // Collect 1-based row indices to remove from AI_suggestions (bottom-to-top to preserve indices)
+  // Collect 1-based row indices to remove from Agent_suggestions (bottom-to-top to preserve indices)
   const rowsToRemove = [];
 
   for (let i = 1; i < data.length; i++) {
@@ -133,7 +133,7 @@ function applyReviewedSuggestions() {
     rowsToRemove.push(i + 1);  // 1-based sheet row
   }
 
-  // Delete processed rows from AI_suggestions (bottom-to-top to preserve row indices)
+  // Delete processed rows from Agent_suggestions (bottom-to-top to preserve row indices)
   rowsToRemove.reverse().forEach(rowNum => sugTab.deleteRow(rowNum));
 
   const summary =
@@ -176,14 +176,14 @@ function applyToDataTab(ss, journalName, fieldName, newValue) {
 
 ### 3. Daily Workflow
 
-1. Agent runs overnight → produces `AI_suggestions.csv`.
+1. Agent runs overnight → produces `Agent_suggestions.csv`.
 2. Run `python3 agent/scripts/upload_suggestions.py` to push to the sheet.
-3. Open the spreadsheet → `AI_suggestions` tab.
+3. Open the spreadsheet → `Agent_suggestions` tab.
 4. For each row: read the `reasoning` and `source_urls`, then set the **Status** dropdown to `approve` or `reject`.
 5. Click **WhereToPublish → Apply Reviewed Suggestions**.
-6. `approve` rows: the suggestion is written to the data tab and the row is moved to `AI_suggestions_processed`.
-7. `reject` rows: the row is moved to `AI_suggestions_processed` without any data change.
-8. `pending` rows remain in `AI_suggestions` for continued review.
+6. `approve` rows: the suggestion is written to the data tab and the row is moved to `Agent_suggestions_processed`.
+7. `reject` rows: the row is moved to `Agent_suggestions_processed` without any data change.
+8. `pending` rows remain in `Agent_suggestions` for continued review.
 9. Trigger the GitHub Actions workflow (or run `bash scripts/run.sh`) to regenerate the website data.
 
 ---

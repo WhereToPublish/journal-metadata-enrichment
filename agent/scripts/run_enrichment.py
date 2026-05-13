@@ -24,7 +24,7 @@ def load_suggestion_keys_from_tabs(service: Any, tab_names: list[str],
     """Read (journal, field, suggested_value) triples from the given sheet tabs.
 
     Used before enrichment runs to avoid re-suggesting values already present in
-    AI_suggestions or AI_suggestions_processed.  Missing or empty tabs are silently
+    Agent_suggestions or Agent_suggestions_processed.  Missing or empty tabs are silently
     skipped so the caller degrades gracefully when those tabs do not yet exist.
 
     Args:
@@ -216,14 +216,14 @@ def main() -> None:
     existing_keys = load_existing_keys(args.output)
 
     # Merge remote keys from Google Sheets to avoid re-suggesting values already
-    # present in AI_suggestions or AI_suggestions_processed.
+    # present in Agent_suggestions or Agent_suggestions_processed.
     try:
         remote_service = sheets_client.get_sheets_service(
             credentials_path=args.credentials, readonly=True
         )
         remote_keys = load_suggestion_keys_from_tabs(
             remote_service,
-            ["AI_suggestions", "AI_suggestions_processed"],
+            ["Agent_suggestions", "Agent_suggestions_processed"],
         )
         existing_keys |= remote_keys
         log(f"Loaded {len(remote_keys)} existing key(s) from remote sheet tabs.")
