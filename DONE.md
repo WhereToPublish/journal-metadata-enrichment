@@ -17,9 +17,14 @@ run_agent.sh
     -> agent/scripts/openclaw_runtime.py
     -> one OpenClaw session per journal
     -> agent/scripts/suggestions_io.py
+  -> agent/scripts/issn_alt_name_suggestions.py (run manually when needed)
+    -> WhereToPublish.github.io/scripts/update_extracted.py — loads ISSN -> title lookups for Scimago, DOAJ, OpenAPC
+    -> scans WhereToPublish.github.io/data_extracted/*.csv for empty Alternative journal name cells with ISSN coverage and any missing-source presence flag
+    -> agent/scripts/suggestions_io.py
   -> agent/output/*
 
 agent/scripts/upload_suggestions.py  (run manually after enrichment)
+  -> agent/scripts/suggestions_io.py — collapses duplicate (journal, field) rows and keeps highest confidence
   -> WhereToPublish.github.io/scripts/sheets_client.py — writes Agent_suggestions tab with Status dropdown
 ```
 
@@ -29,8 +34,10 @@ Key runtime properties:
 - terminal and log files are the authoritative live monitor
 - one OpenClaw session per journal to bound context
 - OpenClaw does the journal-level tool use and browsing
+- deterministic ISSN-based `Alternative journal name` suggestions can be generated locally from Scimago, DOAJ, and OpenAPC without calling the model
 - the agent works only on journals already present in the selected backlog
 - Python owns CSV, state, checkpoint, and log persistence
+- `Agent_suggestions.csv` is canonicalized on `(journal, field)` so only the highest-confidence row for each suggested column is kept
 - unresolved is the normal fallback when evidence is weak or blocked
 - before each enrichment run, remote suggestion keys are loaded from `Agent_suggestions` and `Agent_suggestions_processed`; if loading fails the run degrades gracefully to local-CSV deduplication only
 - Google Sheets API (service-account auth) is used for all spreadsheet I/O: downloading tabs, uploading suggestions, and loading remote deduplication keys
@@ -83,11 +90,25 @@ Shared Google Sheets API module — canonical implementation used by both the WT
 
 Agent scripts (`gap_analysis.py`, `run_enrichment.py`, `upload_suggestions.py`) prepend `WhereToPublish.github.io/scripts/` to `sys.path` so they all import this single copy rather than maintaining a duplicate.
 
+### agent/scripts/issn_alt_name_suggestions.py
+
+Deterministic `Alternative journal name` generator.
+
+- scans the enriched `WhereToPublish.github.io/data_extracted/*.csv` field files
+- targets journals whose `Alternative journal name` is empty, that already have at least one ISSN, and for which at least one of `Present in Scimago`, `Present in DOAJ`, or `Present in openAPC` is `No`
+- resolves the alternative title by ISSN with source priority `Scimago -> DOAJ -> OpenAPC`
+- skips no-op matches whose normalized title equals the current journal name
+- skips ambiguous ISSN collisions within a source when one ISSN maps to multiple genuinely different titles
+- writes `confidence = 1.00`, `suggestion_type = "alt_name"`, `priority = "high"` rows into `agent/output/Agent_suggestions.csv`
+- uses `agent/scripts/suggestions_io.py` so deterministic suggestions and AI suggestions share the same CSV canonicalization rules
+
 ### agent/scripts/upload_suggestions.py
 
 Upload script for staging suggestions in the Google Sheet.
 
 - reads `Agent_suggestions.csv` (default: `agent/output/Agent_suggestions.csv`)
+- removes duplicate `(journal, field)` rows before upload and keeps the highest-confidence row for each suggested column
+- rewrites the cleaned CSV back to disk before uploading when duplicates were present
 - creates or reuses the `Agent_suggestions` tab in the spreadsheet
 - clears existing content and writes a fresh header + data rows
 - prepends a `Status` column (pending / approve / reject); new rows are always uploaded as `pending`
@@ -137,7 +158,7 @@ Current orchestrator.
 - instructs the model that **Business model requires hard evidence** (explicit text on the journal page or DOAJ) and that inference from publisher reputation is not acceptable
 - instructs the model that **absence of APC mention is not evidence** that APC = 0; only suggest APC Euros = 0 when the source explicitly states no charge
 - instructs the model to convert non-Euro APC values using approximate current exchange rates
-- appends accepted rows and updates run state after each journal
+- appends accepted rows and updates run state after each journal; persisted rows are canonicalized through `suggestions_io.py` so only the highest-confidence suggestion survives for each `(journal, field)` pair
 - writes checkpoint CSVs every 10 processed journals
 - provides `load_suggestion_keys_from_tabs(service, tab_names, spreadsheet_id)` — returns a set of `(journal, field, suggested_value)` triples read from the given sheet tabs; missing or unrecognised tabs are silently skipped; 
 
@@ -155,7 +176,9 @@ Headless OpenClaw wrapper.
 Persistence and sanitization layer.
 
 - initializes and normalizes `Agent_suggestions.csv`
-- deduplicates on `(journal, field, suggested_value)`
+- imports canonical `norm_name()` from `WhereToPublish.github.io/scripts/libraries.py`
+- canonicalizes the persisted CSV on `(journal, field)` and keeps the highest-confidence row for each suggested column
+- still loads exact existing-key triples `(journal, field, suggested_value)` for exact-match deduplication against local/remote suggestion history
 - accepts only requested fields and supported schema values
 - rejects publisher-as-institution guesses
 - rejects institution types without a valid institution value
@@ -195,6 +218,7 @@ Relevant files:
 
 The `Agent_suggestions` Google Sheets tab is the staging area for human review.
 
+- both AI-generated rows and deterministic ISSN-based `Alternative journal name` rows are staged in the same tab
 - each row has a `Status` column (pending / approve / reject)
 - new rows are always uploaded as `pending`
 - team members set the status to `approve` or `reject` after reviewing evidence

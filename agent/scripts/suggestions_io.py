@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 from typing import Any
 from enrichment_common import *
+
+if str(WTP_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(WTP_SCRIPTS_DIR))
+
+from libraries import norm_name
 
 
 def ensure_parent(path: Path) -> None:
@@ -43,27 +49,80 @@ def init_suggestions_csv(path: Path) -> None:
         writer.writerow(CSV_HEADERS)
 
 
-def load_existing_keys(path: Path) -> set[tuple[str, str, str]]:
+def normalize_suggestion_row(row: dict[str, Any]) -> dict[str, str]:
+    return {header: str(row.get(header, "") or "") for header in CSV_HEADERS}
+
+
+def load_suggestions(path: Path) -> list[dict[str, str]]:
     init_suggestions_csv(path)
     with open(path, encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
-        return {
-            (
-                row.get("journal", ""),
-                row.get("field", ""),
-                row.get("suggested_value", ""),
-            )
-            for row in reader
-        }
+        return [normalize_suggestion_row(row) for row in reader]
+
+
+def load_existing_keys(path: Path) -> set[tuple[str, str, str]]:
+    return {
+        (
+            row["journal"],
+            row["field"],
+            row["suggested_value"],
+        )
+        for row in load_suggestions(path)
+    }
+
+
+def parse_confidence(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def dedupe_suggestions(
+    rows: list[dict[str, Any]], key_fields: tuple[str, ...] = ("journal", "field")
+) -> tuple[list[dict[str, str]], int]:
+    selected_rows: dict[tuple[str, ...], dict[str, Any]] = {}
+
+    for index, raw_row in enumerate(rows):
+        row = normalize_suggestion_row(raw_row)
+        key = tuple(row.get(field, "") for field in key_fields)
+        if not any(key):
+            continue
+
+        confidence = parse_confidence(row.get("confidence", "0"))
+        existing = selected_rows.get(key)
+        if existing is None:
+            selected_rows[key] = {
+                "first_index": index,
+                "confidence": confidence,
+                "row": row,
+            }
+            continue
+
+        if confidence > existing["confidence"]:
+            existing["confidence"] = confidence
+            existing["row"] = row
+
+    deduped_rows = [
+        item["row"]
+        for item in sorted(selected_rows.values(), key=lambda item: item["first_index"])
+    ]
+    return deduped_rows, len(rows) - len(deduped_rows)
+
+
+def write_suggestions(path: Path, suggestions: list[dict[str, Any]]) -> None:
+    ensure_parent(path)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_HEADERS)
+        writer.writeheader()
+        writer.writerows(normalize_suggestion_row(row) for row in suggestions)
 
 
 def append_suggestions(path: Path, suggestions: list[dict[str, str]]) -> None:
     if not suggestions:
         return
-    init_suggestions_csv(path)
-    with open(path, "a", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_HEADERS)
-        writer.writerows(suggestions)
+    deduped_rows, _ = dedupe_suggestions(load_suggestions(path) + suggestions)
+    write_suggestions(path, deduped_rows)
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -91,7 +150,7 @@ def coerce_source_urls(raw_value: Any) -> list[str]:
 
 
 def normalize_name(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", value.strip().lower())
+    return norm_name(value)
 
 
 def names_equivalent_or_contained(left: str, right: str) -> bool:

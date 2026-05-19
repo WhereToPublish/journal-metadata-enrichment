@@ -66,6 +66,7 @@ echo "Args: $*"
 echo
 
 "$VENV_PYTHON" agent/scripts/run_enrichment.py "$@" 2>&1 | tee "$RUNNER_LOG"
+"$VENV_PYTHON" agent/scripts/issn_alt_suggestions.py 2>&1 | tee "$RUNNER_LOG"
 
 openclaw gateway stop
 

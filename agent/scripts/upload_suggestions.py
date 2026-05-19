@@ -14,7 +14,6 @@ Usage:
 from __future__ import annotations
 from typing import Any
 import argparse
-import csv
 import sys
 from pathlib import Path
 
@@ -26,6 +25,7 @@ if str(WTP_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(WTP_SCRIPTS))
 import sheets_client
 from enrichment_common import SUGGESTIONS_CSV_PATH
+from suggestions_io import dedupe_suggestions, load_suggestions, write_suggestions
 
 SUGGESTIONS_TAB = "Agent_suggestions"
 
@@ -70,9 +70,11 @@ def upload(input_csv: Path, credentials_path: Path | None) -> None:
         print(f"ERROR: input file not found: {input_csv}", file=sys.stderr)
         sys.exit(1)
 
-    with open(input_csv, encoding="utf-8", newline="") as fh:
-        reader = csv.DictReader(fh)
-        rows = list(reader)
+    rows = load_suggestions(input_csv)
+    rows, dropped_rows = dedupe_suggestions(rows)
+    if dropped_rows:
+        write_suggestions(input_csv, rows)
+        print(f"Dropped {dropped_rows} duplicate suggestion(s) from {input_csv} before upload.")
 
     if not rows:
         print("No suggestions to upload — file is empty.")

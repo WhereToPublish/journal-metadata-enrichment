@@ -199,8 +199,8 @@ def main() -> None:
     parser.add_argument("--log-dir", type=Path, default=LOGS_DIR)
     parser.add_argument("--skip-gap-analysis", action="store_true")
     parser.add_argument("--journal", default="", help="Only process a single journal by exact name.")
-    parser.add_argument("--max-suggestions", type=int, default=125,
-                        help="Stop after this many valid suggestions are written (default: 15).")
+    parser.add_argument("--max-suggestions", type=int, default=5,
+                        help="Stop after this many valid suggestions are written (default: 5).")
     parser.add_argument("--local", action="store_true", help="Run the embedded agent instead of the gateway agent.")
     parser.add_argument(
         "--credentials",
