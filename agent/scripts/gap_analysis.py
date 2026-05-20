@@ -57,17 +57,17 @@ REQUIRED_EXTRACTION_FILES = [
 
 # Field priority weights — higher = more important to fill
 FIELD_PRIORITIES = {
-    "Business model":   ("high",   10),
-    "Publisher":        ("high",   9),
+    "Business model":   ("medium", 3),
+    "Publisher":        ("medium", 7),
     "Country":          ("medium", 6),
     "Website":          ("medium", 5),
     "APC Euros":        ("medium", 4),
-    "Publisher type":   ("medium", 3),
-    "Institution":      ("low",    2),
-    "Institution type": ("low",    1),
-    "e-ISSN":           ("low",    0),
-    "p-ISSN":           ("low",    0),
-    "ISSN-L":           ("low",    0),
+    "Publisher type":   ("medium", 8),
+    "Institution":      ("low",    0),
+    "Institution type": ("low",    0),
+    "e-ISSN":           ("high",   10),
+    "p-ISSN":           ("high",   10),
+    "ISSN-L":           ("high",   10),
 }
 
 

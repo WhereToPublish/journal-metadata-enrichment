@@ -15,7 +15,7 @@ WTP_SCRIPTS = Path(__file__).parent.parent.parent / "WhereToPublish.github.io" /
 if str(WTP_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(WTP_SCRIPTS))
 import sheets_client
-from openclaw_runtime import OpenClawRunner
+from openclaw_runtime import DEFAULT_OPENCLAW_TIMEOUT_SECONDS, OpenClawRunner
 from suggestions_io import *
 
 
@@ -199,9 +199,14 @@ def main() -> None:
     parser.add_argument("--log-dir", type=Path, default=LOGS_DIR)
     parser.add_argument("--skip-gap-analysis", action="store_true")
     parser.add_argument("--journal", default="", help="Only process a single journal by exact name.")
-    parser.add_argument("--max-suggestions", type=int, default=5,
-                        help="Stop after this many valid suggestions are written (default: 5).")
-    parser.add_argument("--local", action="store_true", help="Run the embedded agent instead of the gateway agent.")
+    parser.add_argument("--max-suggestions", type=int, default=150,
+                        help="Stop after this many valid suggestions are written (default: 150).")
+    parser.add_argument(
+        "--openclaw-timeout-seconds",
+        type=int,
+        default=DEFAULT_OPENCLAW_TIMEOUT_SECONDS,
+        help="Per-journal timeout for openclaw agent runs (default: 900).",
+    )
     parser.add_argument(
         "--credentials",
         type=Path,
@@ -209,6 +214,13 @@ def main() -> None:
         help="Path to service-account JSON key (default: GOOGLE_SERVICE_ACCOUNT_KEY env var or default path).",
     )
     args = parser.parse_args()
+
+    if args.openclaw_timeout_seconds < 1:
+        parser.error("--openclaw-timeout-seconds must be a positive integer")
+    if args.skip_gap_analysis and not args.gap_report.exists():
+        parser.error(
+            f"--skip-gap-analysis requires an existing gap report at {args.gap_report}"
+        )
 
     init_suggestions_csv(args.output)
     state = load_state(args.state)
@@ -236,7 +248,7 @@ def main() -> None:
         log("Skipping gap analysis (--skip-gap-analysis set)")
 
     report = load_gap_report(args.gap_report)
-    runner = OpenClawRunner(args.log_dir, local=args.local)
+    runner = OpenClawRunner(args.log_dir, timeout_seconds=args.openclaw_timeout_seconds)
 
     # Sort all journals by their highest-priority gap (high → medium → low).
     journals = sorted(report["journals"], key=journal_max_priority)

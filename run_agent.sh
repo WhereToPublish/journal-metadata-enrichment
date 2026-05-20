@@ -10,71 +10,105 @@ OUTPUT_DIR="agent/output"
 LOG_DIR="$OUTPUT_DIR/logs"
 VENV_PYTHON="${JOURNALMIND_PYTHON:-.venv/bin/python}"
 MODEL="${JOURNALMIND_MODEL:-ollama/qwen3:8b}"
+OPENCLAW_TIMEOUT_SECONDS="${JOURNALMIND_OPENCLAW_TIMEOUT_SECONDS:-900}"
 MODEL_TAG="${MODEL#ollama/}"
 RUN_ID="$(date +"%Y%m%d-%H%M%S")"
-OPENCLAW_LOG="$LOG_DIR/run-$RUN_ID.openclaw.jsonl"
 RUNNER_LOG="$LOG_DIR/run-$RUN_ID.runner.log"
-OPENCLAW_LOG_PID=""
 
-cleanup() {
-  [[ -n "$OPENCLAW_LOG_PID" ]] && kill "$OPENCLAW_LOG_PID" 2>/dev/null || true
+fail() {
+  echo "ERROR: $1"
+  exit 1
 }
-trap cleanup EXIT INT TERM
+
+require_command() {
+  local command_name="$1"
+  local error_message="$2"
+
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    fail "$error_message"
+  fi
+}
+
+require_local_model() {
+  if [[ "$MODEL" != ollama/* ]]; then
+    fail "JOURNALMIND_MODEL must reference a local Ollama model (expected ollama/<tag>, got '$MODEL')."
+  fi
+}
+
+check_timeout_setting() {
+  if [[ ! "$OPENCLAW_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+    fail "JOURNALMIND_OPENCLAW_TIMEOUT_SECONDS must be a positive integer (got '$OPENCLAW_TIMEOUT_SECONDS')."
+  fi
+}
+
+check_python_ready() {
+  if [[ ! -x "$VENV_PYTHON" ]]; then
+    fail "Python virtualenv not found at $VENV_PYTHON"
+  fi
+  if ! "$VENV_PYTHON" -c "import polars" >/dev/null 2>&1; then
+    fail "'$VENV_PYTHON' cannot import polars. Run: $VENV_PYTHON -m pip install -r requirements.txt"
+  fi
+}
+
+check_ollama_model() {
+  local ollama_models
+
+  ollama_models="$(ollama list 2>/dev/null)" || {
+    fail "Ollama is not responding. Start with: ollama serve"
+  }
+  if ! echo "$ollama_models" | grep -q "^${MODEL_TAG}[[:space:]]"; then
+    fail "Model '$MODEL_TAG' not found. Pull with: ollama pull $MODEL_TAG"
+  fi
+}
+
+configure_openclaw_defaults() {
+  echo "Configuring OpenClaw local workspace and model ..."
+  openclaw config set agents.defaults.workspace "$SCRIPT_DIR/$WORKSPACE"
+  openclaw config set agents.defaults.model.primary "$MODEL"
+}
+
+run_and_log() {
+  local label="$1"
+  shift
+
+  echo "[$label]" | tee -a "$RUNNER_LOG"
+  "$@" 2>&1 | tee -a "$RUNNER_LOG"
+}
 
 echo "=== JournalMind — WhereToPublish Metadata Enrichment Agent ==="
 echo
 
 mkdir -p "$LOG_DIR" "$OUTPUT_DIR/state"
+: > "$RUNNER_LOG"
 
-if ! command -v openclaw >/dev/null 2>&1; then
-  echo "ERROR: 'openclaw' not found in PATH. Install with: npm install -g openclaw"; exit 1
-fi
-if ! command -v ollama >/dev/null 2>&1; then
-  echo "ERROR: 'ollama' not found in PATH."; exit 1
-fi
-OLLAMA_MODELS="$(ollama list 2>/dev/null)" || { echo "ERROR: Ollama is not responding. Start with: ollama serve"; exit 1; }
-if ! echo "$OLLAMA_MODELS" | grep -q "^${MODEL_TAG}[[:space:]]"; then
-  echo "ERROR: Model '$MODEL_TAG' not found. Pull with: ollama pull $MODEL_TAG"; exit 1
-fi
-if [[ ! -x "$VENV_PYTHON" ]]; then
-  echo "ERROR: Python virtualenv not found at $VENV_PYTHON"; exit 1
-fi
-if ! "$VENV_PYTHON" -c "import polars" >/dev/null 2>&1; then
-  echo "ERROR: '$VENV_PYTHON' cannot import polars. Run: $VENV_PYTHON -m pip install -r requirements.txt"; exit 1
-fi
+require_command "openclaw" "'openclaw' not found in PATH. Install with: npm install -g openclaw"
+require_command "ollama" "'ollama' not found in PATH."
+require_local_model
+check_timeout_setting
+check_ollama_model
+check_python_ready
 
 echo "Workspace : $WORKSPACE"
 echo "Model     : $MODEL"
+echo "OpenClaw  : local"
+echo "Timeout   : ${OPENCLAW_TIMEOUT_SECONDS}s per journal"
 echo "Runner log: $RUNNER_LOG"
 echo "Python    : $VENV_PYTHON"
 echo
 
-echo "Configuring OpenClaw workspace and model ..."
-openclaw config set agents.defaults.workspace "$SCRIPT_DIR/$WORKSPACE"
-openclaw config set agents.defaults.model.primary "$MODEL"
-
-echo "Restarting OpenClaw gateway ..."
-openclaw gateway install >/dev/null 2>&1 || true
-openclaw gateway restart >/dev/null 2>&1 || openclaw gateway start >/dev/null 2>&1
-
-echo "Capturing OpenClaw logs to: $OPENCLAW_LOG"
-openclaw logs --follow --json >> "$OPENCLAW_LOG" 2>&1 &
-OPENCLAW_LOG_PID=$!
+configure_openclaw_defaults
 
 echo "Starting enrichment runner ..."
 echo "Args: $*"
 echo
 
-"$VENV_PYTHON" agent/scripts/run_enrichment.py "$@" 2>&1 | tee "$RUNNER_LOG"
-"$VENV_PYTHON" agent/scripts/issn_alt_suggestions.py 2>&1 | tee "$RUNNER_LOG"
+RUNNER_ARGS=("$@" "--openclaw-timeout-seconds" "$OPENCLAW_TIMEOUT_SECONDS")
 
-openclaw gateway stop
+run_and_log "run_enrichment.py" "$VENV_PYTHON" agent/scripts/run_enrichment.py "${RUNNER_ARGS[@]}"
+run_and_log "issn_alt_name_suggestions.py" "$VENV_PYTHON" agent/scripts/issn_alt_name_suggestions.py
 
 echo
 echo "Run finished."
 echo "Runner log  : $RUNNER_LOG"
-echo "OpenClaw log: $OPENCLAW_LOG"
 echo "Suggestions : $OUTPUT_DIR/Agent_suggestions.csv"
 echo "State       : $OUTPUT_DIR/state/run_state.json"
-echo
-echo "To stop the gateway: openclaw gateway stop"

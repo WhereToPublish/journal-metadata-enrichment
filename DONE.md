@@ -8,6 +8,8 @@ The current end-to-end flow is:
 
 ```text
 run_agent.sh
+  -> enforces a local ollama/<tag> model
+  -> passes embedded local mode and the configured per-journal timeout into run_enrichment.py
   -> agent/scripts/gap_analysis.py (unless skipped)
     -> verifies external data files exist in WhereToPublish.github.io/data_extraction/
     -> WhereToPublish.github.io/scripts/sheets_client.py — downloads all 10 sheet tabs
@@ -17,7 +19,7 @@ run_agent.sh
     -> agent/scripts/openclaw_runtime.py
     -> one OpenClaw session per journal
     -> agent/scripts/suggestions_io.py
-  -> agent/scripts/issn_alt_name_suggestions.py (run manually when needed)
+  -> agent/scripts/issn_alt_name_suggestions.py
     -> WhereToPublish.github.io/scripts/update_extracted.py — loads ISSN -> title lookups for Scimago, DOAJ, OpenAPC
     -> scans WhereToPublish.github.io/data_extracted/*.csv for empty Alternative journal name cells with ISSN coverage and any missing-source presence flag
     -> agent/scripts/suggestions_io.py
@@ -32,6 +34,9 @@ Key runtime properties:
 
 - fully automated startup from the terminal
 - terminal and log files are the authoritative live monitor
+- the launcher always uses embedded `openclaw agent --local` for journal runs
+- the launcher only accepts local Ollama models (`ollama/<tag>`) and never depends on gateway-mode Ollama auth or a remote Ollama API key
+- the per-journal OpenClaw timeout defaults to 900 seconds and can be overridden with `JOURNALMIND_OPENCLAW_TIMEOUT_SECONDS`
 - one OpenClaw session per journal to bound context
 - OpenClaw does the journal-level tool use and browsing
 - deterministic ISSN-based `Alternative journal name` suggestions can be generated locally from Scimago, DOAJ, and OpenAPC without calling the model
@@ -59,20 +64,21 @@ Key runtime properties:
 - changes into the repo root before launching anything
 - uses `.venv/bin/python` by default, with `JOURNALMIND_PYTHON` as the override
 - checks that `openclaw` and `ollama` exist and that Ollama is responding
+- rejects non-Ollama or non-local model ids; the expected format is `ollama/<tag>`
 - checks that the selected Ollama model exists locally
 - checks that `.venv/bin/python` can import `polars`
+- validates `JOURNALMIND_OPENCLAW_TIMEOUT_SECONDS` as a positive integer
 - sets `agents.defaults.workspace` to `agent/workspace`
 - sets `agents.defaults.model.primary` to the selected model
-- restarts or starts the OpenClaw gateway
-- starts `openclaw logs --follow --json` and redirects its raw JSONL output directly to `agent/output/logs/run-<RUN_ID>.openclaw.jsonl` (no filtering)
-- launches `agent/scripts/run_enrichment.py` forwarding all extra arguments
+- launches `agent/scripts/run_enrichment.py` forwarding all extra arguments, while always appending `--openclaw-timeout-seconds <value>`; the enrichment runtime itself is now local-only
+- appends `agent/scripts/issn_alt_name_suggestions.py` output to the same runner log instead of overwriting the enrichment log
 - reports the effective output, state, and log paths at the end of the run
-- cleans up the background OpenClaw log tail on exit
 
 Current model behavior:
 
 - default model: `ollama/qwen3:8b`
 - override mechanism: `JOURNALMIND_MODEL=ollama/<tag>`
+- default per-journal timeout: `JOURNALMIND_OPENCLAW_TIMEOUT_SECONDS=900`
 - all journals across all 10 tabs are processed, sorted by priority (high → medium → low); stops when `--max-suggestions` valid suggestions are written (default: 15)
 - extra launcher arguments are forwarded directly to `run_enrichment.py`
 
@@ -152,6 +158,8 @@ Current orchestrator.
 - loads the gap report and selects journals by priority
 - supports `--journal` for exact single-journal targeting
 - supports `--journal-limit`, `--max-suggestions`, `--output`, `--state`, and `--log-dir`
+- supports `--openclaw-timeout-seconds` for the per-journal OpenClaw budget
+- requires an existing gap report when `--skip-gap-analysis` is used
 - gives each journal a unique OpenClaw session id
 - passes known metadata (including `e_issn`, `p_issn`, `issn_l`), requested gaps, and direct lookup URLs to the model; when any ISSN is known the prompt includes `scimago_by_issn` (Scimago search by ISSN) and `doaj_by_issn` as the preferred sources for resolving `Alternative journal name`
 - tells the model to use tools, return JSON only, and stay within the provided existing-journal backlog
@@ -166,9 +174,11 @@ Current orchestrator.
 
 Headless OpenClaw wrapper.
 
-- runs `openclaw agent --session-id ... --message ... --thinking off --json`
+- runs `openclaw agent --local --session-id ... --message ... --thinking off --json --timeout ...`
+- is split into small helpers for retry-prompt construction, artifact-path resolution, session-payload recovery, CLI-payload parsing, timeout result synthesis, and process cleanup
 - writes prompt, stdout JSON, and stderr logs per journal session
 - extracts the model JSON object from the returned payload text
+- monitors the OpenClaw session log while the CLI is running; if the local model has already produced a final assistant JSON but the CLI parent is still lingering, it terminates the whole process group and returns the completed payload instead of misclassifying the journal as a timeout
 - retries once when the model returns non-JSON output; the retry uses a **compact prompt** (full instructions stripped, only a short JSON-only directive + the Evidence JSON block retained) to prevent context overflow from compounding across attempts
 
 ### agent/scripts/suggestions_io.py
@@ -258,8 +268,7 @@ Checkpoint files:
 
 Run-level logs:
 
-- `agent/output/logs/run-*.openclaw.jsonl` — raw archived OpenClaw JSON log stream
-- `agent/output/logs/run-*.runner.log` — clean orchestrator output
+- `agent/output/logs/run-*.runner.log` — combined `run_enrichment.py` + `issn_alt_name_suggestions.py` output
 
 Per-journal artifacts:
 
