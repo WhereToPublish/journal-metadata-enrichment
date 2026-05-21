@@ -9,9 +9,11 @@ WORKSPACE="agent/workspace"
 OUTPUT_DIR="agent/output"
 LOG_DIR="$OUTPUT_DIR/logs"
 VENV_PYTHON="${JOURNALMIND_PYTHON:-.venv/bin/python}"
-MODEL="${JOURNALMIND_MODEL:-ollama/qwen3:8b}"
+MODEL="${JOURNALMIND_MODEL:-ollama/qwen2.5:14b-ctx128k}"
 OPENCLAW_TIMEOUT_SECONDS="${JOURNALMIND_OPENCLAW_TIMEOUT_SECONDS:-900}"
+JOURNALMIND_MAX_SUGGESTIONS=150
 MODEL_TAG="${MODEL#ollama/}"
+DOCKER_IMAGE="journalmind-openclaw"
 RUN_ID="$(date +"%Y%m%d-%H%M%S")"
 RUNNER_LOG="$LOG_DIR/run-$RUN_ID.runner.log"
 
@@ -61,10 +63,18 @@ check_ollama_model() {
   fi
 }
 
-configure_openclaw_defaults() {
-  echo "Configuring OpenClaw local workspace and model ..."
-  openclaw config set agents.defaults.workspace "$SCRIPT_DIR/$WORKSPACE"
-  openclaw config set agents.defaults.model.primary "$MODEL"
+check_docker_ready() {
+  require_command "docker" "'docker' not found in PATH. Install Docker Desktop: https://www.docker.com/products/docker-desktop"
+  if ! docker info >/dev/null 2>&1; then
+    fail "Docker daemon is not running. Start Docker Desktop and retry."
+  fi
+}
+
+build_docker_image_if_needed() {
+  if ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
+    echo "Building Docker image '$DOCKER_IMAGE' (first run may take a few minutes) ..."
+    docker build -t "$DOCKER_IMAGE" .
+  fi
 }
 
 run_and_log() {
@@ -81,28 +91,27 @@ echo
 mkdir -p "$LOG_DIR" "$OUTPUT_DIR/state"
 : > "$RUNNER_LOG"
 
-require_command "openclaw" "'openclaw' not found in PATH. Install with: npm install -g openclaw"
 require_command "ollama" "'ollama' not found in PATH."
 require_local_model
 check_timeout_setting
+check_docker_ready
 check_ollama_model
 check_python_ready
+build_docker_image_if_needed
 
 echo "Workspace : $WORKSPACE"
 echo "Model     : $MODEL"
-echo "OpenClaw  : local"
+echo "Container : $DOCKER_IMAGE"
 echo "Timeout   : ${OPENCLAW_TIMEOUT_SECONDS}s per journal"
 echo "Runner log: $RUNNER_LOG"
 echo "Python    : $VENV_PYTHON"
 echo
 
-configure_openclaw_defaults
-
 echo "Starting enrichment runner ..."
 echo "Args: $*"
 echo
 
-RUNNER_ARGS=("$@" "--openclaw-timeout-seconds" "$OPENCLAW_TIMEOUT_SECONDS")
+RUNNER_ARGS=("$@" "--openclaw-timeout-seconds" "$OPENCLAW_TIMEOUT_SECONDS" "--max-suggestions" "${JOURNALMIND_MAX_SUGGESTIONS:-5}")
 
 run_and_log "run_enrichment.py" "$VENV_PYTHON" agent/scripts/run_enrichment.py "${RUNNER_ARGS[@]}"
 run_and_log "issn_alt_name_suggestions.py" "$VENV_PYTHON" agent/scripts/issn_alt_name_suggestions.py

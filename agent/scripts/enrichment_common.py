@@ -48,7 +48,7 @@ ALLOWED_PRIORITIES = {"high", "medium", "low"}
 ALLOWED_SUGGESTION_TYPES = {"fill", "alt_name", "correct", "remove"}
 ALLOWED_BUSINESS_MODELS = {"OA diamond", "OA", "Hybrid", "Subscription"}
 
-DEFAULT_MODEL = "ollama/qwen3:8b"
+DEFAULT_MODEL = "ollama/qwen2.5:14b-ctx128k"
 
 
 def slugify(value: str) -> str:

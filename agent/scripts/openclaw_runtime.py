@@ -9,6 +9,15 @@ import subprocess
 import time
 from typing import Any, cast
 
+from enrichment_common import DEFAULT_MODEL, OUTPUT_DIR
+
+DOCKER_IMAGE = "journalmind-openclaw"
+# Inside the container agent/output is mounted at /data/output.
+# Session JSONL files are written to /data/output/state/openclaw-sessions,
+# which maps to OUTPUT_DIR/state/openclaw-sessions on the host.
+_CONTAINER_OUTPUT_DIR = "/data/output"
+_CONTAINER_STATE_DIR = f"{_CONTAINER_OUTPUT_DIR}/state/openclaw-sessions"
+
 
 DEFAULT_OPENCLAW_TIMEOUT_SECONDS = 900
 DEFAULT_OPENCLAW_MAX_ATTEMPTS = 2
@@ -16,22 +25,70 @@ DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_PROCESS_STOP_GRACE_SECONDS = 2.0
 
 
+def _strip_json_line_comments(text: str) -> str:
+    """Remove // line comments from JSON-like text, preserving // inside strings."""
+    result: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if escape:
+            result.append(c)
+            escape = False
+        elif c == "\\" and in_string:
+            result.append(c)
+            escape = True
+        elif c == '"':
+            in_string = not in_string
+            result.append(c)
+        elif not in_string and c == "/" and i + 1 < len(text) and text[i + 1] == "/":
+            # Skip to end of line (but keep the newline itself)
+            while i < len(text) and text[i] != "\n":
+                i += 1
+            continue
+        else:
+            result.append(c)
+        i += 1
+    return "".join(result)
+
+
 def _extract_json_block(text: str) -> dict[str, Any] | None:
     stripped = text.strip()
     if not stripped:
         return None
+
+    # Strip a leading fenced code block (```json ... ```)
     if stripped.startswith("```"):
         stripped = stripped.split("\n", 1)[1] if "\n" in stripped else stripped
         stripped = stripped.rsplit("```", 1)[0].strip()
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    candidate = stripped[start:end + 1]
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
+
+    # Remove // line comments that LLMs sometimes add inside JSON objects
+    stripped = _strip_json_line_comments(stripped)
+
+    # Scan every `{` position and return the first valid JSON dict that
+    # looks like the expected agent-response schema.  Using raw_decode avoids
+    # the "first-{ to last-}" heuristic that breaks when the text contains
+    # multiple JSON objects (e.g. inline tool results followed by the final
+    # answer).
+    decoder = json.JSONDecoder()
+    best: dict[str, Any] | None = None
+    idx = 0
+    while True:
+        start = stripped.find("{", idx)
+        if start == -1:
+            break
+        try:
+            obj, _ = decoder.raw_decode(stripped, start)
+            if isinstance(obj, dict):
+                if "suggestions" in obj and "status" in obj:
+                    return obj
+                if best is None:
+                    best = obj
+        except json.JSONDecodeError:
+            pass
+        idx = start + 1
+    return best
 
 
 @dataclass
@@ -52,10 +109,24 @@ class RunArtifacts:
     session_path: Path
 
 
-def _build_retry_prompt(prompt: str) -> str:
+def _build_retry_prompt(prompt: str, previous_response: str = "") -> str:
     evidence_marker = "\nEvidence:\n"
     evidence_start = prompt.rfind(evidence_marker)
     evidence_block = prompt[evidence_start:] if evidence_start != -1 else prompt
+
+    previous_section = ""
+    if previous_response.strip():
+        truncated = previous_response.strip()[:3000]
+        previous_section = (
+            "\nYour previous analysis was:\n"
+            "---\n"
+            + truncated
+            + "\n---\n\n"
+            "Using the findings above, "
+        )
+    else:
+        previous_section = "Based on the evidence below, "
+
     return (
         "You must return exactly one JSON object and nothing else.\n"
         "Do not fetch any additional URLs. Do not explain your reasoning outside the JSON.\n"
@@ -71,15 +142,35 @@ def _build_retry_prompt(prompt: str) -> str:
         '  "status": "ok" | "unresolved",\n'
         '  "notes": string\n'
         "}\n"
+        + previous_section
+        + "return a JSON object with your findings.\n"
         + evidence_block
     )
 
 
-def _resolve_openclaw_state_dir() -> Path:
-    configured = os.environ.get("OPENCLAW_STATE_DIR", "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / ".openclaw"
+def _build_docker_command(
+    session_id: str,
+    prompt: str,
+    timeout_seconds: int,
+    output_dir: Path,
+    model: str,
+    image: str = DOCKER_IMAGE,
+) -> list[str]:
+    return [
+        "docker", "run", "--rm",
+        "-v", f"{output_dir}:{_CONTAINER_OUTPUT_DIR}",
+        "-e", f"OPENCLAW_STATE_DIR={_CONTAINER_STATE_DIR}",
+        "-e", f"JOURNALMIND_MODEL={model}",
+        "-e", "OLLAMA_API_KEY=ollama-local",
+        "--add-host", "host.docker.internal:host-gateway",
+        image,
+        "openclaw", "agent", "--local",
+        "--session-id", session_id,
+        "--message", prompt,
+        "--thinking", "off",
+        "--json",
+        "--timeout", str(timeout_seconds),
+    ]
 
 
 def _build_run_artifacts(log_dir: Path, state_dir: Path, session_id: str) -> RunArtifacts:
@@ -172,10 +263,12 @@ def _stop_process(process: subprocess.Popen[str],
 def _parse_response_json(stdout: str) -> dict[str, Any] | None:
     if not stdout.strip():
         return None
+    # The Docker entrypoint emits status lines before the CLI JSON; try strict
+    # parse first, then fall back to scanning for the JSON object.
     try:
         return json.loads(stdout)
     except json.JSONDecodeError:
-        return None
+        return _extract_json_block(stdout)
 
 
 def _extract_cli_payload(response_json: dict[str, Any] | None) -> tuple[str, dict[str, Any] | None]:
@@ -233,6 +326,12 @@ def _wait_for_process(process: subprocess.Popen[str], session_path: Path,
     while True:
         if process.poll() is not None:
             stdout, stderr = process.communicate()
+            # Final session check — the JSONL is written just before the process
+            # exits, so polling may have missed it in the last interval.
+            if session_parsed_payload is None:
+                session_payload = _extract_session_payload(session_path)
+                if session_payload is not None:
+                    session_payload_text, session_parsed_payload = session_payload
             return stdout, stderr, session_payload_text, session_parsed_payload, False
 
         session_payload = _extract_session_payload(session_path)
@@ -258,27 +357,11 @@ class OpenClawRunner:
                  timeout_seconds: int = DEFAULT_OPENCLAW_TIMEOUT_SECONDS,
                  max_attempts: int = DEFAULT_OPENCLAW_MAX_ATTEMPTS) -> None:
         self.log_dir = log_dir
-        self.state_dir = _resolve_openclaw_state_dir()
+        self.model = os.environ.get("JOURNALMIND_MODEL", DEFAULT_MODEL)
+        self.state_dir = OUTPUT_DIR / "state" / "openclaw-sessions"
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
         self.log_dir.mkdir(parents=True, exist_ok=True)
-
-    @staticmethod
-    def _build_command(session_id: str, prompt: str, timeout_seconds: int) -> list[str]:
-        return [
-            "openclaw",
-            "agent",
-            "--local",
-            "--session-id",
-            session_id,
-            "--message",
-            prompt,
-            "--thinking",
-            "off",
-            "--json",
-            "--timeout",
-            str(timeout_seconds),
-        ]
 
     def _run_once(self, session_id: str, prompt: str,
                   timeout_seconds: int | None = None) -> AgentRunResult:
@@ -287,7 +370,7 @@ class OpenClawRunner:
         artifacts.prompt_path.write_text(prompt, encoding="utf-8")
 
         process = subprocess.Popen(
-            self._build_command(session_id, prompt, effective_timeout_seconds),
+            _build_docker_command(session_id, prompt, effective_timeout_seconds, OUTPUT_DIR, self.model),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -329,12 +412,17 @@ class OpenClawRunner:
             max_attempts: int | None = None) -> AgentRunResult:
         effective_timeout_seconds = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         effective_max_attempts = self.max_attempts if max_attempts is None else max_attempts
-        retry_prompt = _build_retry_prompt(prompt)
 
         result: AgentRunResult | None = None
         for attempt in range(1, effective_max_attempts + 1):
             attempt_session_id = session_id if attempt == 1 else f"{session_id}-retry{attempt - 1}"
-            attempt_prompt = prompt if attempt == 1 else retry_prompt
+            if attempt == 1:
+                attempt_prompt = prompt
+            else:
+                attempt_prompt = _build_retry_prompt(
+                    prompt,
+                    previous_response=result.payload_text if result is not None else "",
+                )
             result = self._run_once(attempt_session_id, attempt_prompt, timeout_seconds=effective_timeout_seconds)
             if result.parsed_payload is not None:
                 return result

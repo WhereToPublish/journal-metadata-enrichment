@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import urllib.parse
+import urllib.request
 
 # Resolve the WTP scripts directory before importing sheets_client so we always
 # use the canonical implementation in WhereToPublish.github.io/scripts/ rather
@@ -82,6 +83,44 @@ def log(message: str) -> None:
     print(f"[{timestamp}] {message}", flush=True)
 
 
+
+
+def fetch_doaj_data(issn: str) -> dict[str, Any] | None:
+    """Pre-fetch DOAJ API data for a journal by ISSN (e-ISSN, p-ISSN, or ISSN-L).
+
+    Returns a simplified dict with the most useful fields extracted from bibjson,
+    or None if the journal was not found or the request failed.
+    """
+    if not issn:
+        return None
+    url = f"https://doaj.org/api/v3/search/journals/issn:{urllib.parse.quote(issn)}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "JournalMind/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        if data.get("total", 0) < 1:
+            return None
+        bj = data["results"][0]["bibjson"]
+        apc = bj.get("apc", {})
+        apc_max = apc.get("max", [{}])[0] if apc.get("max") else {}
+        licenses = bj.get("license", [])
+        license_type = licenses[0].get("type", "") if licenses else ""
+        return {
+            "found": True,
+            "doaj_title": bj.get("title", ""),
+            "publisher": bj.get("publisher", {}).get("name", ""),
+            "eissn": bj.get("eissn", ""),
+            "pissn": bj.get("pissn", ""),
+            "apc_has_apc": apc.get("has_apc", False),
+            "apc_price": apc_max.get("price"),
+            "apc_currency": apc_max.get("currency", ""),
+            "boai": bj.get("boai", False),
+            "license": license_type,
+        }
+    except Exception:
+        return None
+
+
 def run_gap_analysis(wtp_dir: Path, output_path: Path) -> None:
     command = [sys.executable, str(GAP_ANALYSIS_SCRIPT), "--wtp-dir", str(wtp_dir), "--output", str(output_path)]
     log("Running gap analysis ...")
@@ -92,7 +131,7 @@ def load_gap_report(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def build_prompt(journal_gap: dict[str, Any]) -> str:
+def build_prompt(journal_gap: dict[str, Any], doaj_data: dict[str, Any] | None = None) -> str:
     encoded_name = urllib.parse.quote(journal_gap["name"])
     e_issn = journal_gap.get("e_issn", "")
     p_issn = journal_gap.get("p_issn", "")
@@ -111,10 +150,19 @@ def build_prompt(journal_gap: dict[str, Any]) -> str:
             "p_issn": p_issn,
             "issn_l": issn_l,
         },
+        "prefetched_doaj_data": doaj_data if doaj_data else {"found": False},
         "lookup_urls": {
             "official_website": journal_gap.get("website", ""),
-            "doaj_search": f"https://doaj.org/search/journals/{encoded_name}",
-            "doaj_by_issn": f"https://doaj.org/toc/{doaj_issn}" if doaj_issn else "",
+            # Only include DOAJ API URLs when we don't have pre-fetched data
+            # (if pre-fetched data is available, the agent should use it directly)
+            **(
+                {}
+                if doaj_data
+                else {
+                    "doaj_api_by_issn": f"https://doaj.org/api/v3/search/journals/issn:{urllib.parse.quote(doaj_issn)}" if doaj_issn else "",
+                    "doaj_api_by_title": f"https://doaj.org/api/v3/search/journals/title:{urllib.parse.quote(journal_gap['name'])}",
+                }
+            ),
             "scimago_search": f"https://www.scimagojr.com/journalsearch.php?q={encoded_name}&tip=jou",
             "scimago_by_issn": f"https://www.scimagojr.com/journalsearch.php?q={scimago_issn}&tip=issn" if scimago_issn else "",
         },
@@ -124,9 +172,15 @@ def build_prompt(journal_gap: dict[str, Any]) -> str:
     has_issn = bool(journal_gap.get("e_issn") or journal_gap.get("p_issn") or journal_gap.get("issn_l"))
     return (
             "Research exactly one journal.\n"
+            "IMPORTANT: Start by reading prefetched_doaj_data in the Evidence section below. "
+            "If prefetched_doaj_data.found is true, that data is already verified DOAJ data — treat it as authoritative evidence WITHOUT fetching any DOAJ URL:\n"
+            "  - apc_has_apc=true with apc_price/apc_currency → sufficient evidence for Business model='OA' and APC Euros (convert to EUR if needed)\n"
+            "  - apc_has_apc=false and found=true → sufficient evidence for Business model='OA diamond' AND APC Euros='0' (DOAJ has_apc=false is explicit 'no APC' evidence)\n"
+            "  - publisher gives the publisher name\n"
+            "  - license gives the license type (e.g., 'CC BY')\n"
+            "After extracting data from prefetched_doaj_data, use the fetch tool ONLY for gaps that still need evidence (e.g., Scimago for alternative journal name).\n"
             "Use the available tools in this run, including web search and page fetch tools, to gather evidence.\n"
             "If web search is unavailable, use the provided lookup URLs directly with the fetch tool before falling back to other public sources.\n"
-            "Prefer this source order when applicable: DOAJ, the official publisher or journal website, Scimago, then other public sources.\n"
             "Do not write or edit files in this run; return structured JSON only.\n"
             "Do not invent facts or URLs. Only cite URLs you actually visited during this run.\n"
             "Do not propose adding new journals. Work only on the provided journal and the requested gaps for that existing record.\n"
@@ -143,7 +197,7 @@ def build_prompt(journal_gap: dict[str, Any]) -> str:
             "Do not use a publisher company name as Institution or Institution type unless the evidence explicitly identifies it as the institution.\n"
             "APC Euros must be a plain integer string with no currency symbol.\n"
             "A website that does not mention APCs is NOT evidence that APC = 0. Absence of mention means the source is insufficient — leave APC Euros unresolved.\n"
-            "Only suggest APC Euros = 0 when the source explicitly states there is no charge (e.g. 'no APC', 'free to publish', 'APC is 0', 'does not charge').\n"
+            "Only suggest APC Euros = 0 when the source explicitly states there is no charge (e.g. 'no APC', 'free to publish', 'APC is 0', 'does not charge') OR when prefetched_doaj_data.apc_has_apc is false.\n"
             "If an APC is listed in a non-Euro currency (GBP, USD, etc.), convert it using approximate current exchange rates, or leave it unresolved if uncertain.\n"
             + (
                 "The known business model for this journal is 'Subscription'. Do NOT suggest APC Euros = 0 for a Subscription journal.\n"
@@ -154,20 +208,31 @@ def build_prompt(journal_gap: dict[str, Any]) -> str:
             + (
                 "An ISSN is available for this journal. To find the Alternative journal name: "
                 "first fetch lookup_urls.scimago_by_issn (Scimago search by ISSN) — the result title is the exact Scimago name. "
-                "Also try lookup_urls.doaj_by_issn. "
-                "Do NOT infer the Alternative journal name from topic keywords — only use names you find in Scimago or DOAJ.\n"
+                + (
+                    "Also check prefetched_doaj_data.doaj_title (already fetched — do not re-fetch DOAJ). "
+                    if doaj_data
+                    else "Also try lookup_urls.doaj_api_by_issn (JSON API — check results[0].bibjson.title). "
+                )
+                + "Do NOT infer the Alternative journal name from topic keywords — only use names you find in Scimago or DOAJ.\n"
                 if has_issn
                 else
                 "No ISSN is available. To find the Alternative journal name: search Scimago and DOAJ by journal name. "
-                "Only suggest a name if you find an unambiguous match (same publisher, same scope). "
+                + (
+                    "Check prefetched_doaj_data.doaj_title (already fetched). "
+                    if doaj_data
+                    else "You can use lookup_urls.doaj_api_by_title (JSON API) to search by title. "
+                )
+                + "Only suggest a name if you find an unambiguous match (same publisher, same scope). "
                 "Do NOT infer from topic keywords.\n"
             )
             + "Alternative journal name suggestions require confidence >= 0.70; suggestions below that threshold will be rejected.\n"
               "Each suggestion must have confidence between 0 and 1, and you should only return suggestions with confidence >= 0.55.\n"
+              "Use status 'ok' when you have at least one suggestion to report. "
+              "Use status 'unresolved' only when you have zero suggestions (all gaps lacked sufficient evidence).\n"
               "You MUST always return a single JSON object, even if all sources are blocked or unavailable. "
               "If the evidence is insufficient for all requested gaps, return: "
               '{\"journal\": \"<name>\", \"suggestions\": [], \"status\": \"unresolved\", \"notes\": \"<brief reason>\"}\n'
-              "Return exactly one JSON object with this schema and nothing else:\n"
+              "Return exactly one JSON object with this schema and nothing else. Do NOT include comments inside the JSON (no // or /* */ comments):\n"
               "{\n"
               '  "journal": string,\n'
               '  "suggestions": [{"field": string, "current_value": string, "suggested_value": string, "confidence": number, "source_urls": string[], "reasoning": string, "suggestion_type": string, "priority": string}],\n'
@@ -199,8 +264,8 @@ def main() -> None:
     parser.add_argument("--log-dir", type=Path, default=LOGS_DIR)
     parser.add_argument("--skip-gap-analysis", action="store_true")
     parser.add_argument("--journal", default="", help="Only process a single journal by exact name.")
-    parser.add_argument("--max-suggestions", type=int, default=150,
-                        help="Stop after this many valid suggestions are written (default: 150).")
+    parser.add_argument("--max-suggestions", type=int, default=5,
+                        help="Stop after this many valid suggestions are written.")
     parser.add_argument(
         "--openclaw-timeout-seconds",
         type=int,
@@ -268,7 +333,11 @@ def main() -> None:
         processed_count += 1
         session_id = f"enrichment-{datetime.now().strftime('%Y%m%d%H%M%S')}-{slugify(journal_gap['name'])}"
         log(f"[{processed_count}] {journal_gap['name']}")
-        prompt = build_prompt(journal_gap)
+        doaj_issn = journal_gap.get("e_issn") or journal_gap.get("p_issn") or journal_gap.get("issn_l")
+        doaj_data = fetch_doaj_data(doaj_issn) if doaj_issn else None
+        if doaj_data:
+            log(f"  DOAJ: found (apc_has_apc={doaj_data['apc_has_apc']}, apc={doaj_data['apc_price']} {doaj_data['apc_currency']})")
+        prompt = build_prompt(journal_gap, doaj_data=doaj_data)
         run_result = runner.run(session_id=session_id, prompt=prompt)
 
         status, cleaned_rows, notes = sanitize_agent_result(

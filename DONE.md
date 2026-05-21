@@ -8,8 +8,9 @@ The current end-to-end flow is:
 
 ```text
 run_agent.sh
+  -> verifies Docker daemon, journalmind-openclaw image, ollama model
   -> enforces a local ollama/<tag> model
-  -> passes embedded local mode and the configured per-journal timeout into run_enrichment.py
+  -> passes Docker image, model, and per-journal timeout into run_enrichment.py
   -> agent/scripts/gap_analysis.py (unless skipped)
     -> verifies external data files exist in WhereToPublish.github.io/data_extraction/
     -> WhereToPublish.github.io/scripts/sheets_client.py — downloads all 10 sheet tabs
@@ -17,7 +18,8 @@ run_agent.sh
   -> agent/scripts/run_enrichment.py
     -> load_suggestion_keys_from_tabs() — loads remote deduplication keys
     -> agent/scripts/openclaw_runtime.py
-    -> one OpenClaw session per journal
+       -> docker run journalmind-openclaw openclaw agent --local ...
+          (one container per journal; /data/output mounted from agent/output)
     -> agent/scripts/suggestions_io.py
   -> agent/scripts/issn_alt_name_suggestions.py
     -> WhereToPublish.github.io/scripts/update_extracted.py — loads ISSN -> title lookups for Scimago, DOAJ, OpenAPC
@@ -34,11 +36,15 @@ Key runtime properties:
 
 - fully automated startup from the terminal
 - terminal and log files are the authoritative live monitor
-- the launcher always uses embedded `openclaw agent --local` for journal runs
-- the launcher only accepts local Ollama models (`ollama/<tag>`) and never depends on gateway-mode Ollama auth or a remote Ollama API key
+- OpenClaw runs exclusively inside the `journalmind-openclaw` Docker container — it is **not** installed on the host
+- each journal gets its own container; containers exit when the journal session completes
+- the only host filesystem path mounted into the container is `agent/output/` (→ `/data/output` inside the container)
+- the OpenClaw workspace (`agent/workspace/`) is baked into the Docker image at build time and not accessible from the host at runtime
+- the container entrypoint runs `openclaw onboard --skip-health` at startup to configure Ollama connectivity, then execs the requested `openclaw agent` command
+- Ollama runs on the host; the container reaches it at `http://host.docker.internal:11434`
 - the per-journal OpenClaw timeout defaults to 900 seconds and can be overridden with `JOURNALMIND_OPENCLAW_TIMEOUT_SECONDS`
 - one OpenClaw session per journal to bound context
-- OpenClaw does the journal-level tool use and browsing
+- OpenClaw does the journal-level tool use and browsing (Chromium is available in the container)
 - deterministic ISSN-based `Alternative journal name` suggestions can be generated locally from Scimago, DOAJ, and OpenAPC without calling the model
 - the agent works only on journals already present in the selected backlog
 - Python owns CSV, state, checkpoint, and log persistence
@@ -51,6 +57,8 @@ Key runtime properties:
 
 - `README.md`: human-facing overview of the current runtime
 - `DONE.md`: this file
+- `Dockerfile`: builds `journalmind-openclaw` from `ghcr.io/openclaw/openclaw:latest`; installs Chromium; bakes `agent/workspace/` into `/app/workspace`; sets `agent/docker/entrypoint.sh` as the container entrypoint
+- `agent/docker/entrypoint.sh`: container entrypoint — runs `openclaw onboard --non-interactive --auth-choice ollama --custom-base-url http://host.docker.internal:11434 --custom-model-id <model> --accept-risk --skip-health`, patches workspace and model into `$OPENCLAW_STATE_DIR/openclaw.json`, removes any stale `models.json`, then execs the requested command
 - `GOOGLE_APP_SCRIPT.md`: Apps Script setup for the human review workflow
 - `NEXT_STEPS.md`: roadmap for using suggestion history to improve the agent
 - `run_agent.sh`: launcher used for real runs
@@ -63,20 +71,19 @@ Key runtime properties:
 
 - changes into the repo root before launching anything
 - uses `.venv/bin/python` by default, with `JOURNALMIND_PYTHON` as the override
-- checks that `openclaw` and `ollama` exist and that Ollama is responding
+- checks that Docker daemon is running and the `journalmind-openclaw` image exists
+- checks that `ollama` exists and is responding
 - rejects non-Ollama or non-local model ids; the expected format is `ollama/<tag>`
 - checks that the selected Ollama model exists locally
 - checks that `.venv/bin/python` can import `polars`
 - validates `JOURNALMIND_OPENCLAW_TIMEOUT_SECONDS` as a positive integer
-- sets `agents.defaults.workspace` to `agent/workspace`
-- sets `agents.defaults.model.primary` to the selected model
-- launches `agent/scripts/run_enrichment.py` forwarding all extra arguments, while always appending `--openclaw-timeout-seconds <value>`; the enrichment runtime itself is now local-only
+- launches `agent/scripts/run_enrichment.py` forwarding all extra arguments, while always appending `--openclaw-timeout-seconds <value>`
 - appends `agent/scripts/issn_alt_name_suggestions.py` output to the same runner log instead of overwriting the enrichment log
 - reports the effective output, state, and log paths at the end of the run
 
 Current model behavior:
 
-- default model: `ollama/qwen3:8b`
+- default model: `ollama/qwen2.5:14b-ctx128k` (128 K context window; created from `agent/docker/Modelfile`)
 - override mechanism: `JOURNALMIND_MODEL=ollama/<tag>`
 - default per-journal timeout: `JOURNALMIND_OPENCLAW_TIMEOUT_SECONDS=900`
 - all journals across all 10 tabs are processed, sorted by priority (high → medium → low); stops when `--max-suggestions` valid suggestions are written (default: 15)
@@ -161,10 +168,13 @@ Current orchestrator.
 - supports `--openclaw-timeout-seconds` for the per-journal OpenClaw budget
 - requires an existing gap report when `--skip-gap-analysis` is used
 - gives each journal a unique OpenClaw session id
-- passes known metadata (including `e_issn`, `p_issn`, `issn_l`), requested gaps, and direct lookup URLs to the model; when any ISSN is known the prompt includes `scimago_by_issn` (Scimago search by ISSN) and `doaj_by_issn` as the preferred sources for resolving `Alternative journal name`
+- **pre-fetches DOAJ API data** for each journal via `fetch_doaj_data()` (called from the host, before the Docker container starts): uses `https://doaj.org/api/v3/search/journals/issn:<issn>` and extracts `found`, `doaj_title`, `publisher`, `apc_has_apc`, `apc_price`, `apc_currency`, `boai`, `license`; the pre-fetched data is included in the `prefetched_doaj_data` field of the prompt Evidence JSON and in the runner log line
+- **omits DOAJ API lookup URLs** from `lookup_urls` when pre-fetched data is available, to prevent the model from re-fetching DOAJ from inside the Docker container (which may be Cloudflare-blocked); DOAJ API URLs are only included when DOAJ pre-fetch returned no result
+- passes known metadata (including `e_issn`, `p_issn`, `issn_l`), prefetched DOAJ data, requested gaps, and direct lookup URLs to the model; when any ISSN is known the prompt includes `scimago_by_issn` as the preferred source for resolving `Alternative journal name`
 - tells the model to use tools, return JSON only, and stay within the provided existing-journal backlog
-- instructs the model that **Business model requires hard evidence** (explicit text on the journal page or DOAJ) and that inference from publisher reputation is not acceptable
-- instructs the model that **absence of APC mention is not evidence** that APC = 0; only suggest APC Euros = 0 when the source explicitly states no charge
+- instructs the model to read `prefetched_doaj_data` before calling any tools: `apc_has_apc=true` with a price is sufficient evidence for Business model='OA' and APC Euros; `apc_has_apc=false` is sufficient evidence for Business model='OA diamond' and APC Euros='0'
+- instructs the model that **Business model requires hard evidence** (explicit text on the journal page, DOAJ, or prefetched_doaj_data) and that inference from publisher reputation is not acceptable
+- instructs the model that **absence of APC mention is not evidence** that APC = 0; only suggest APC Euros = 0 when the source explicitly states no charge, or when `prefetched_doaj_data.apc_has_apc` is false
 - instructs the model to convert non-Euro APC values using approximate current exchange rates
 - appends accepted rows and updates run state after each journal; persisted rows are canonicalized through `suggestions_io.py` so only the highest-confidence suggestion survives for each `(journal, field)` pair
 - writes checkpoint CSVs every 10 processed journals
@@ -172,13 +182,15 @@ Current orchestrator.
 
 ### agent/scripts/openclaw_runtime.py
 
-Headless OpenClaw wrapper.
+Docker-based OpenClaw wrapper.
 
-- runs `openclaw agent --local --session-id ... --message ... --thinking off --json --timeout ...`
-- is split into small helpers for retry-prompt construction, artifact-path resolution, session-payload recovery, CLI-payload parsing, timeout result synthesis, and process cleanup
+- builds and runs `docker run --rm -v <output_dir>:/data/output -e OPENCLAW_STATE_DIR=... -e JOURNALMIND_MODEL=... -e OLLAMA_API_KEY=ollama-local --add-host host.docker.internal:host-gateway journalmind-openclaw openclaw agent --local --session-id ... --message ... --thinking off --json --timeout ...`
+- the Docker image tag is `journalmind-openclaw` (configurable via `DOCKER_IMAGE`)
+- is split into small helpers for Docker-command building, retry-prompt construction, artifact-path resolution, session-payload recovery, CLI-payload parsing, timeout result synthesis, and process cleanup
 - writes prompt, stdout JSON, and stderr logs per journal session
 - extracts the model JSON object from the returned payload text
-- monitors the OpenClaw session log while the CLI is running; if the local model has already produced a final assistant JSON but the CLI parent is still lingering, it terminates the whole process group and returns the completed payload instead of misclassifying the journal as a timeout
+- **strips `//` line comments** from JSON-like text before parsing (via `_strip_json_line_comments()`): LLMs sometimes annotate JSON values with `// comment` which is invalid JSON; the comment stripper correctly handles `//` inside string literals
+- monitors the OpenClaw session JSONL log while the container is running; if the local model has already produced a final assistant response but the container is still lingering, it terminates the process group and returns the completed payload instead of misclassifying the journal as a timeout
 - retries once when the model returns non-JSON output; the retry uses a **compact prompt** (full instructions stripped, only a short JSON-only directive + the Evidence JSON block retained) to prevent context overflow from compounding across attempts
 
 ### agent/scripts/suggestions_io.py
@@ -208,8 +220,9 @@ Persistence and sanitization layer.
 Current emphasis:
 
 - one journal per session
-- use tools for research
-- start from caller-provided lookup URLs (including `doaj_by_issn` when an ISSN is known) before relying on search
+- use tools for research; but read `prefetched_doaj_data` first before calling any tools
+- start from caller-provided lookup URLs (Scimago for alternative name) after consuming pre-fetched DOAJ data
+- DOAJ API data pre-fetched by the runner on the host avoids Cloudflare blocking inside Docker
 - return one JSON object when the caller asks for JSON only
 - do not propose adding new journals
 - do not write files in the normal automation path

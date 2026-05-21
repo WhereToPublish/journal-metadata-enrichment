@@ -1,13 +1,5 @@
 # Local Tool Conventions
 
-## exec / process
-- The working directory is the repo root that contains `run_agent.sh`.
-- Use relative paths from the repo root.
-- Preferred Python interpreter: `.venv/bin/python`.
-- Do NOT run destructive commands (`rm -rf`, `git push`, `git reset --hard`).
-- Do NOT modify any files inside `WhereToPublish.github.io/`.
-- Only run local scripts when the caller explicitly asks for it.
-
 ## web_search / web_fetch
 - Start with the provided lookup URLs and the known website via `web_fetch`.
 - Use `web_search` only when additional discovery is needed and the search backend is available.
@@ -16,7 +8,7 @@
 - If a page is blocked, paywalled, loops on redirects, or returns repeated 403/CAPTCHA responses, skip it and keep the journal unresolved.
 
 ## read / write
-- Read runtime inputs, logs, and outputs under `agent/output/` when needed.
+- Read runtime inputs, logs, and outputs under `/data/output/` when needed.
 - In automated one-journal mode, return structured suggestion objects; the caller persists CSV and state files.
 - Never mutate `Agent_suggestions.csv` directly unless the caller explicitly asks for file editing.
 - Never write inside `WhereToPublish.github.io/`.
