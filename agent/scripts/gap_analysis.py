@@ -36,6 +36,8 @@ if str(WTP_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(WTP_SCRIPTS))
 import sheets_client as _sheets_client
 
+from enrichment_common import is_empty
+
 # ---------------------------------------------------------------------------
 # Paths and constants
 # ---------------------------------------------------------------------------
@@ -167,11 +169,6 @@ def load_csv_as_dicts(path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def is_empty(val) -> bool:
-    """True if value is None, empty string, or whitespace."""
-    return val is None or str(val).strip() == ""
-
-
 def compute_gaps(raw_row: dict, enriched_row: dict | None) -> list[dict]:
     """Return a list of gap dicts for a single journal."""
     gaps = []
@@ -182,8 +179,13 @@ def compute_gaps(raw_row: dict, enriched_row: dict | None) -> list[dict]:
     issn_fields = {"e-ISSN", "p-ISSN", "ISSN-L"}
     any_issn_present = any(not is_empty(row.get(f, "")) for f in issn_fields)
 
+    current_bm = row.get("Business model", "").strip()
+
     for field, (priority, weight) in FIELD_PRIORITIES.items():
         if field in issn_fields and any_issn_present:
+            continue
+        # APC Euros is never applicable for Subscription journals — they have no OA option.
+        if field == "APC Euros" and current_bm == "Subscription":
             continue
         if is_empty(row.get(field, "")):
             gaps.append({

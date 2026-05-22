@@ -300,6 +300,11 @@ def sanitize_agent_result(journal_name: str, journal_gap: dict[str, Any], agent_
         cleaned_rows.append(row)
 
     final_status = status if status in {"ok", "unresolved"} else "error"
-    if final_status == "ok" and not cleaned_rows:
+    if cleaned_rows:
+        # If we wrote any valid suggestions, always mark the journal as resolved —
+        # the model sometimes returns "unresolved" when only partially resolving gaps.
+        final_status = "ok"
+    elif final_status == "ok":
+        # Model said ok but all suggestions were filtered out — treat as unresolved.
         final_status = "unresolved"
     return final_status, cleaned_rows, notes

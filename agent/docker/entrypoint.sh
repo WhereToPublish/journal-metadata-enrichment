@@ -42,6 +42,12 @@ with open(path) as fh:
     cfg = json.load(fh)
 cfg.setdefault('agents', {}).setdefault('defaults', {})['workspace'] = '/app/workspace'
 cfg['agents']['defaults'].setdefault('model', {})['primary'] = os.environ.get('JOURNALMIND_MODEL', 'ollama/qwen3:8b')
+# Increase the per-agent run timeout (covers the entire journal enrichment session)
+cfg['agents']['defaults']['timeoutSeconds'] = 900
+# Increase the Ollama provider idle timeout (time without a new token from the LLM)
+# The 14B model on local GPU/CPU can take 2-3 min to start generating output
+for provider in cfg.get('models', {}).get('providers', {}).values():
+    provider['timeoutSeconds'] = 600
 with open(path, 'w') as fh:
     json.dump(cfg, fh, indent=2)
 PYEOF

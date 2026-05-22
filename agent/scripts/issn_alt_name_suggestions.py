@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
 
-from enrichment_common import DEFAULT_WTP_DIR, SUGGESTIONS_CSV_PATH, WTP_SCRIPTS_DIR
+from enrichment_common import DEFAULT_WTP_DIR, is_empty, SUGGESTIONS_CSV_PATH, WTP_SCRIPTS_DIR
 
 if str(WTP_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(WTP_SCRIPTS_DIR))
@@ -64,10 +64,6 @@ def working_directory(path: Path) -> Iterator[None]:
         yield
     finally:
         os.chdir(previous_cwd)
-
-
-def is_empty(value: str | None) -> bool:
-    return value is None or str(value).strip() == ""
 
 
 def load_csv_rows(path: Path) -> list[dict[str, str]]:

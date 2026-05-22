@@ -1,9 +1,10 @@
 # Local Tool Conventions
 
 ## web_search / web_fetch
-- Start with the provided lookup URLs and the known website via `web_fetch`.
+- **Always start** with `prefetched_doaj_data` and `prefetched_openalex_data` from the Evidence section — these are already fetched and reliable; no network call needed.
+- Then use the provided lookup URLs and the known website via `web_fetch`.
 - Use `web_search` only when additional discovery is needed and the search backend is available.
-- Preferred source order: DOAJ, official journal or publisher page, Scimago, then other public sources such as CrossRef.
+- Preferred source order: pre-fetched DOAJ data, pre-fetched OpenAlex data, official journal or publisher page, Scimago, then CrossRef (`https://api.crossref.org/journals/<ISSN>`) and other public sources.
 - Do NOT log into any site.
 - If a page is blocked, paywalled, loops on redirects, or returns repeated 403/CAPTCHA responses, skip it and keep the journal unresolved.
 

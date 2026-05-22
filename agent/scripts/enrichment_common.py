@@ -55,3 +55,8 @@ def slugify(value: str) -> str:
     lowered = value.strip().lower()
     lowered = re.sub(r"[^a-z0-9]+", "-", lowered)
     return lowered.strip("-") or "journal"
+
+
+def is_empty(value: object) -> bool:
+    """True if value is None, empty string, or whitespace."""
+    return value is None or str(value).strip() == ""

@@ -99,6 +99,7 @@ the first pass fails (no Scimago rank), the journal gets no Scimago data at all.
 | Scimago | Rank, Quartile, H index, Publisher (if empty), Business model (if empty), e-ISSN, p-ISSN |
 | OpenAPC | APC Euros, Publisher (if empty), Business model (if empty), e-ISSN, p-ISSN, ISSN-L |
 | DOAJ | Publisher (if empty), Country, Website, Institution, APC Euros (if empty), e-ISSN, p-ISSN |
+| OpenAlex | APC Euros (in EUR directly), Business model (via is_oa + apc_usd), Publisher (if empty) |
 | Dataverse | APC Euros (if empty), Publisher (if empty), Business model (if empty) |
 
 Fields the pipeline NEVER overwrites (always defer to manual curation):
@@ -114,10 +115,11 @@ Journals still have empty cells after enrichment because:
 - The journal is genuinely new or niche → find the value directly from the publisher page
 
 For each missing field, attempt in this order:
-1. Check DOAJ (fastest, covers OA status + publisher + country + APC)
-2. Check the journal's own website (most authoritative for APCs)
-3. Check Scimago (for rank/quartile, and to discover the alt name)
-4. Check CrossRef (for publisher info)
+1. Check `prefetched_doaj_data` (pre-fetched, authoritative for OA status + publisher + country + APC)
+2. Check `prefetched_openalex_data` (pre-fetched, reliable APC data in EUR for Hybrid/OA journals)
+3. Check the journal's own website (most authoritative for APCs when not blocked)
+4. Check Scimago (for rank/quartile, and to discover the alt name)
+5. Check CrossRef (`https://api.crossref.org/journals/<ISSN>`) for publisher info
 
 #### Finding the Alternative journal name
 `Alternative journal name` is the **highest-priority gap** — getting this right unlocks Scimago rank, quartile, and H-index for the journal.
@@ -160,9 +162,16 @@ Out of scope for this runtime:
 |-------|-----------|------------|
 | L1 | Publisher page confirms field AND DOAJ agrees | ≥ 0.90 |
 | L2 | DOAJ confirms alone (curated registry, highly reliable) | 0.80–0.89 |
+| L2b | OpenAlex APC data (sourced from ESAC/OpenAPC registries) | 0.75–0.84 |
 | L3 | Scimago confirms OR publisher page alone (no DOAJ entry) | 0.65–0.79 |
 | L4 | CrossRef or other secondary source alone | 0.55–0.64 |
 | L5 | Single ambiguous or low-quality source | < 0.55 → SKIP |
+
+### Using pre-fetched data
+The caller pre-fetches `prefetched_doaj_data` and `prefetched_openalex_data` before your session starts. **Always read these first** before making any web requests.
+
+- **prefetched_doaj_data**: DOAJ API data. If `apc_has_apc=false` → APC Euros = 0 at confidence 0.90. If `apc_has_apc=true` + price → APC at confidence 0.85.
+- **prefetched_openalex_data**: OpenAlex data. If `apc_eur` is set → use that value for APC Euros at confidence 0.80. If `apc_usd` only → convert to EUR (× 0.92) at confidence 0.75. Business model from `is_oa` + `apc_usd` at confidence 0.75.
 
 ### Business model — publisher reputation is L5 (SKIP)
 If your only evidence for a Business model is "Publisher X is known for subscription journals" or similar reputation-based reasoning, that is **L5 — below the confidence threshold, do not suggest it**.

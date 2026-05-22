@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
+import re
 import subprocess
 import sys
 import urllib.parse
@@ -85,6 +86,209 @@ def log(message: str) -> None:
 
 
 
+def generate_crossref_issn_suggestions(
+    journal_name: str,
+    journal_gap: dict[str, Any],
+    crossref_data: dict[str, Any] | None,
+    existing_keys: set[tuple[str, str, str]],
+) -> list[dict[str, str]]:
+    """Build suggestion rows for ISSN fields directly from CrossRef data.
+
+    Bypasses the LLM agent for fields where CrossRef provides reliable data.
+    Only fires when crossref_data.found=True and exact_match=True.
+    """
+    if not crossref_data or not crossref_data.get("found") or not crossref_data.get("exact_match"):
+        return []
+
+    gap_fields = {gap["field"] for gap in journal_gap["gaps"]}
+    p_issn = crossref_data.get("p_issn", "")
+    e_issn = crossref_data.get("e_issn", "")
+    all_issns = crossref_data.get("all_issns", [])
+    # ISSN-L is typically equal to p_issn (or the only ISSN if only one exists)
+    issn_l = p_issn or (all_issns[0] if all_issns else "")
+
+    anchor_issn = p_issn or e_issn or (all_issns[0] if all_issns else "")
+    source_url = f"https://api.crossref.org/journals/{anchor_issn}" if anchor_issn else "https://api.crossref.org"
+    confidence = 0.90
+
+    rows: list[dict[str, str]] = []
+    for field, value in [("p-ISSN", p_issn), ("e-ISSN", e_issn), ("ISSN-L", issn_l)]:
+        if field not in gap_fields or not value:
+            continue
+        if not re.match(r"^\d{4}-[\dX][\dX][\dX][\dX]$", value):
+            continue
+        key = (journal_name, field, value)
+        if key in existing_keys:
+            continue
+        rows.append({
+            "journal": journal_name,
+            "field": field,
+            "current_value": "",
+            "suggested_value": value,
+            "confidence": f"{confidence:.2f}",
+            "source_urls": source_url,
+            "reasoning": (
+                f"Found via CrossRef (DOI registration agency) with exact title match "
+                f"(source: {crossref_data.get('source', 'journals')} API)."
+            ),
+            "suggestion_type": "fill",
+            "priority": "high",
+        })
+    return rows
+
+
+def fetch_openalex_data(issn: str) -> dict[str, Any] | None:
+    """Pre-fetch OpenAlex data for a journal by ISSN.
+
+    OpenAlex is a public academic metadata service that is not blocked from
+    Docker containers. It provides APC data in multiple currencies (including EUR),
+    OA status, and publisher — useful as a fallback when DOAJ has no entry and
+    publisher websites return 403.
+
+    Returns a simplified dict or None if the journal was not found / request failed.
+    """
+    if not issn:
+        return None
+    url = f"https://api.openalex.org/sources?filter=issn:{urllib.parse.quote(issn)}&select=display_name,issn,issn_l,host_organization_name,is_oa,apc_usd,apc_prices,type"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "JournalMind/1.0 (mailto:wheretopublish@github.com)"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        results = data.get("results", [])
+        if not results:
+            return None
+        r = results[0]
+        apc_prices = r.get("apc_prices", []) or []
+        apc_eur = next(
+            (p.get("price") for p in apc_prices if p.get("currency") == "EUR"),
+            None,
+        )
+        return {
+            "found": True,
+            "display_name": r.get("display_name", ""),
+            "publisher": r.get("host_organization_name", ""),
+            "is_oa": r.get("is_oa", False),
+            "apc_usd": r.get("apc_usd"),
+            "apc_eur": apc_eur,
+            "apc_prices": apc_prices,
+            "issn": r.get("issn", []),
+            "type": r.get("type", ""),
+        }
+    except Exception:
+        return None
+
+
+def _extract_crossref_issns(issn_types: list, all_issns: list) -> tuple[str, str]:
+    """Extract p_issn and e_issn from an issn-type list."""
+    p_issn = ""
+    e_issn = ""
+    for entry in issn_types:
+        if entry.get("type") == "print":
+            p_issn = entry.get("value", "")
+        elif entry.get("type") == "electronic":
+            e_issn = entry.get("value", "")
+    # Fallback when no typed ISSNs
+    if not p_issn and not e_issn and all_issns:
+        p_issn = all_issns[0]
+    return p_issn, e_issn
+
+
+def fetch_crossref_data(journal_name: str) -> dict[str, Any] | None:
+    """Pre-fetch CrossRef data for a journal by title.
+
+    CrossRef is a public DOI registration agency that maintains ISSN records
+    for journals. It's accessible from Docker containers and provides p-ISSN
+    and e-ISSN for most journals — useful when DOAJ and official websites are
+    unavailable.
+
+    Strategy: try the /journals endpoint first (most accurate ISSN type
+    classification); fall back to /works?query.container-title for journals
+    that don't appear in the journals index.
+
+    Returns a simplified dict or None if not found / request failed.
+    """
+    if not journal_name:
+        return None
+    _headers = {"User-Agent": "JournalMind/1.0 (mailto:wheretopublish@github.com)"}
+
+    # ── 1. Try journals API (reliable ISSN type classification) ──────────────
+    try:
+        url = (
+            "https://api.crossref.org/journals?query="
+            + urllib.parse.quote_plus(journal_name)
+            + "&rows=5"
+        )
+        req = urllib.request.Request(url, headers=_headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        items = data.get("message", {}).get("items", [])
+        if items:
+            best = next(
+                (item for item in items if item.get("title", "").lower() == journal_name.lower()),
+                items[0],
+            )
+            all_issns = best.get("ISSN", [])
+            p_issn, e_issn = _extract_crossref_issns(best.get("issn-type", []), all_issns)
+            return {
+                "found": True,
+                "title": best.get("title", ""),
+                "publisher": best.get("publisher", ""),
+                "p_issn": p_issn,
+                "e_issn": e_issn,
+                "all_issns": all_issns,
+                "exact_match": best.get("title", "").lower() == journal_name.lower(),
+                "source": "journals",
+            }
+    except Exception:
+        pass
+
+    # ── 2. Fallback: works API (broader coverage; ISSN type less reliable) ───
+    try:
+        url = (
+            "https://api.crossref.org/works?query.container-title="
+            + urllib.parse.quote_plus(journal_name)
+            + "&rows=10&select=container-title,ISSN,issn-type,publisher"
+        )
+        req = urllib.request.Request(url, headers=_headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        items = data.get("message", {}).get("items", [])
+        if not items:
+            return None
+        # Prefer an exact container-title match; fall back to first result.
+        best = None
+        exact = False
+        for item in items:
+            for ct in item.get("container-title", []):
+                if ct.lower() == journal_name.lower():
+                    best = item
+                    exact = True
+                    break
+            if best:
+                break
+        if best is None:
+            best = items[0]
+        # Collect all unique ISSNs across matched items for best coverage.
+        all_issns = list({issn for item in items for issn in item.get("ISSN", [])})
+        p_issn, e_issn = _extract_crossref_issns(best.get("issn-type", []), all_issns)
+        ct = (best.get("container-title") or [""])[0]
+        return {
+            "found": True,
+            "title": ct,
+            "publisher": best.get("publisher", ""),
+            "p_issn": p_issn,
+            "e_issn": e_issn,
+            "all_issns": all_issns,
+            "exact_match": exact,
+            "source": "works",
+        }
+    except Exception:
+        return None
+
+
 def fetch_doaj_data(issn: str) -> dict[str, Any] | None:
     """Pre-fetch DOAJ API data for a journal by ISSN (e-ISSN, p-ISSN, or ISSN-L).
 
@@ -131,7 +335,7 @@ def load_gap_report(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def build_prompt(journal_gap: dict[str, Any], doaj_data: dict[str, Any] | None = None) -> str:
+def build_prompt(journal_gap: dict[str, Any], doaj_data: dict[str, Any] | None = None, openalex_data: dict[str, Any] | None = None, crossref_data: dict[str, Any] | None = None) -> str:
     encoded_name = urllib.parse.quote(journal_gap["name"])
     e_issn = journal_gap.get("e_issn", "")
     p_issn = journal_gap.get("p_issn", "")
@@ -151,6 +355,8 @@ def build_prompt(journal_gap: dict[str, Any], doaj_data: dict[str, Any] | None =
             "issn_l": issn_l,
         },
         "prefetched_doaj_data": doaj_data if doaj_data else {"found": False},
+        "prefetched_openalex_data": openalex_data if openalex_data else {"found": False},
+        "prefetched_crossref_data": crossref_data if crossref_data else {"found": False},
         "lookup_urls": {
             "official_website": journal_gap.get("website", ""),
             # Only include DOAJ API URLs when we don't have pre-fetched data
@@ -172,13 +378,31 @@ def build_prompt(journal_gap: dict[str, Any], doaj_data: dict[str, Any] | None =
     has_issn = bool(journal_gap.get("e_issn") or journal_gap.get("p_issn") or journal_gap.get("issn_l"))
     return (
             "Research exactly one journal.\n"
-            "IMPORTANT: Start by reading prefetched_doaj_data in the Evidence section below. "
+            "IMPORTANT: Start by reading prefetched_doaj_data, prefetched_openalex_data, and prefetched_crossref_data in the Evidence section below BEFORE fetching any URLs.\n"
             "If prefetched_doaj_data.found is true, that data is already verified DOAJ data — treat it as authoritative evidence WITHOUT fetching any DOAJ URL:\n"
             "  - apc_has_apc=true with apc_price/apc_currency → sufficient evidence for Business model='OA' and APC Euros (convert to EUR if needed)\n"
             "  - apc_has_apc=false and found=true → sufficient evidence for Business model='OA diamond' AND APC Euros='0' (DOAJ has_apc=false is explicit 'no APC' evidence)\n"
             "  - publisher gives the publisher name\n"
             "  - license gives the license type (e.g., 'CC BY')\n"
-            "After extracting data from prefetched_doaj_data, use the fetch tool ONLY for gaps that still need evidence (e.g., Scimago for alternative journal name).\n"
+            "If prefetched_openalex_data.found is true, that data is from OpenAlex (a public academic metadata service) — use it as supporting evidence:\n"
+            "  - apc_eur is the APC in EUR directly (if available) — use this value for APC Euros\n"
+            "  - apc_usd is the APC in USD (convert to EUR at ~0.92 if apc_eur is not set)\n"
+            "  - apc_prices lists APC prices in all available currencies — prefer EUR, then convert from GBP/USD\n"
+            "  - is_oa=true AND apc_usd>0 → strong evidence for Business model='OA'\n"
+            "  - is_oa=false AND apc_usd>0 → strong evidence for Business model='Hybrid' (subscription journal with OA option)\n"
+            "  - is_oa=false AND apc_usd=null → suggests Business model='Subscription' (but verify with publisher page if possible)\n"
+            "  - is_oa=true AND apc_usd=null → suggests Business model='OA diamond' (but verify — DOAJ is more authoritative for this)\n"
+            "  - publisher from OpenAlex can fill the Publisher field\n"
+            "OpenAlex APC data is sourced from ESAC/OpenAPC registries and is generally reliable for Hybrid and OA journals.\n"
+            "If prefetched_crossref_data.found is true, that data is from CrossRef (the DOI registration agency — reliable ISSN source):\n"
+            "  - p_issn: the print ISSN — use directly for the p-ISSN field\n"
+            "  - e_issn: the electronic ISSN — use directly for the e-ISSN field\n"
+            "  - ISSN-L is typically equal to p_issn (or the only ISSN if only one exists)\n"
+            "  - If exact_match=true, the title matched exactly — confidence is high (0.90). DO NOT fetch any URLs for ISSN fields; CrossRef data is sufficient.\n"
+            "  - If exact_match=false, the title matched approximately — verify publisher matches known_metadata.publisher, confidence ~0.75\n"
+            "  - If source='works', ISSN type classification (print/electronic) is less reliable — treat p_issn/e_issn as approximate; all_issns lists the raw ISSNs\n"
+            "  - Do NOT use p_issn/e_issn as the Alternative journal name — they are ISSN values, not journal titles\n"
+            "After extracting data from prefetched_doaj_data, prefetched_openalex_data, and prefetched_crossref_data, use the fetch tool ONLY for gaps that still need evidence.\n"
             "Use the available tools in this run, including web search and page fetch tools, to gather evidence.\n"
             "If web search is unavailable, use the provided lookup URLs directly with the fetch tool before falling back to other public sources.\n"
             "Do not write or edit files in this run; return structured JSON only.\n"
@@ -335,21 +559,73 @@ def main() -> None:
         log(f"[{processed_count}] {journal_gap['name']}")
         doaj_issn = journal_gap.get("e_issn") or journal_gap.get("p_issn") or journal_gap.get("issn_l")
         doaj_data = fetch_doaj_data(doaj_issn) if doaj_issn else None
+        openalex_data = fetch_openalex_data(doaj_issn) if doaj_issn else None
+        # Pre-fetch CrossRef for ISSN gaps (only when ISSNs are missing from known_metadata)
+        has_all_issns = bool(journal_gap.get("e_issn") and journal_gap.get("p_issn") and journal_gap.get("issn_l"))
+        crossref_data = None if has_all_issns else fetch_crossref_data(journal_gap["name"])
         if doaj_data:
             log(f"  DOAJ: found (apc_has_apc={doaj_data['apc_has_apc']}, apc={doaj_data['apc_price']} {doaj_data['apc_currency']})")
-        prompt = build_prompt(journal_gap, doaj_data=doaj_data)
-        run_result = runner.run(session_id=session_id, prompt=prompt)
+        if openalex_data:
+            log(f"  OpenAlex: found (is_oa={openalex_data['is_oa']}, apc_eur={openalex_data['apc_eur']}, apc_usd={openalex_data['apc_usd']})")
+        if crossref_data:
+            log(f"  CrossRef: found (title={crossref_data['title']!r}, p_issn={crossref_data['p_issn']!r}, e_issn={crossref_data['e_issn']!r}, exact={crossref_data['exact_match']})")
+        prompt = build_prompt(journal_gap, doaj_data=doaj_data, openalex_data=openalex_data, crossref_data=crossref_data)
 
-        status, cleaned_rows, notes = sanitize_agent_result(
+        # Generate ISSN suggestions directly from CrossRef (exact matches only).
+        # These bypass the LLM and are always written when CrossRef has reliable data.
+        crossref_rows = generate_crossref_issn_suggestions(
             journal_name=journal_gap["name"],
             journal_gap=journal_gap,
-            agent_result=run_result.parsed_payload,
+            crossref_data=crossref_data,
             existing_keys=existing_keys,
         )
+        # Pre-register CrossRef keys so the LLM doesn't duplicate them.
+        crossref_keys_added: set[tuple[str, str, str]] = set()
+        for row in crossref_rows:
+            key = (row["journal"], row["field"], row["suggested_value"])
+            existing_keys.add(key)
+            crossref_keys_added.add(key)
+
+        # Skip LLM when only Institution/Institution type gaps remain:
+        # these fields have never been successfully resolved by the LLM in practice.
+        SKIPPABLE_FIELDS = {"Institution", "Institution type"}
+        crossref_covered = {row["field"] for row in crossref_rows}
+        remaining_gap_fields = {g["field"] for g in journal_gap["gaps"]} - crossref_covered
+        skip_llm = remaining_gap_fields.issubset(SKIPPABLE_FIELDS)
+
+        if skip_llm:
+            log(f"  Skipping LLM (only {remaining_gap_fields or 'Institution/type'} gaps remain, unresolvable)")
+            status = "ok" if crossref_rows else "unresolved"
+            llm_rows = []
+            notes = (
+                "ISSN(s) resolved via CrossRef. Institution/type gaps skipped (LLM cannot resolve)."
+                if crossref_rows
+                else "Skipped: only Institution/type gaps, LLM cannot resolve these fields."
+            )
+        else:
+            run_result = runner.run(session_id=session_id, prompt=prompt)
+
+            status, llm_rows, notes = sanitize_agent_result(
+                journal_name=journal_gap["name"],
+                journal_gap=journal_gap,
+                agent_result=run_result.parsed_payload,
+                existing_keys=existing_keys,
+            )
+
+        # Merge: CrossRef suggestions first, then any additional LLM suggestions.
+        cleaned_rows = crossref_rows + llm_rows
+        if cleaned_rows and status == "unresolved":
+            status = "ok"
+            notes = (
+                (f"ISSN(s) resolved via CrossRef. {notes}".strip() if notes and notes != "-" else "ISSN(s) resolved via CrossRef.")
+                if crossref_rows else notes
+            )
 
         append_suggestions(args.output, cleaned_rows)
         for row in cleaned_rows:
-            existing_keys.add((row["journal"], row["field"], row["suggested_value"]))
+            key = (row["journal"], row["field"], row["suggested_value"])
+            if key not in crossref_keys_added:
+                existing_keys.add(key)
         written_suggestions += len(cleaned_rows)
 
         state.setdefault("processed_journals", []).append(

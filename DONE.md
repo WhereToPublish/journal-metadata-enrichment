@@ -169,10 +169,13 @@ Current orchestrator.
 - requires an existing gap report when `--skip-gap-analysis` is used
 - gives each journal a unique OpenClaw session id
 - **pre-fetches DOAJ API data** for each journal via `fetch_doaj_data()` (called from the host, before the Docker container starts): uses `https://doaj.org/api/v3/search/journals/issn:<issn>` and extracts `found`, `doaj_title`, `publisher`, `apc_has_apc`, `apc_price`, `apc_currency`, `boai`, `license`; the pre-fetched data is included in the `prefetched_doaj_data` field of the prompt Evidence JSON and in the runner log line
+- **pre-fetches OpenAlex data** for each journal via `fetch_openalex_data()` (called from the host): uses `https://api.openalex.org/sources?filter=issn:<issn>&select=...` and extracts `is_oa`, `apc_usd`, `apc_prices`, `host_organization_name`; included in the prompt as `prefetched_openalex_data`; OpenAlex APC data is sourced from ESAC/OpenAPC registries and is reliable for Hybrid and OA journals
+- **CrossRef ISSN bypass** via `generate_crossref_issn_suggestions()`: queries `https://api.crossref.org/journals?query=<name>&rows=5` (CrossRef journals API), with fallback to `https://api.crossref.org/works?query.bibliographic=<name>&rows=1`; when an exact or high-confidence title match is found, returns ISSN suggestion rows (`p-ISSN`, `e-ISSN`, `ISSN-L`) directly — without LLM involvement — using `confidence=0.90` (exact match) or `0.75` (fuzzy); pre-registers these rows in `existing_keys` so the LLM cannot duplicate them
+- **LLM-skip optimization**: after CrossRef ISSN suggestions are resolved, computes `remaining_gap_fields = {g["field"] for g in journal_gap["gaps"]} - crossref_covered`; if `remaining_gap_fields` is a subset of `{"Institution", "Institution type"}` (fields the LLM has never resolved in practice), sets `skip_llm=True` and bypasses the Docker container entirely; status is `ok` if CrossRef produced rows, `unresolved` otherwise; this applies to ~77% of journals in the backlog and reduces per-journal time from ~5 minutes to ~2 seconds for those journals
 - **omits DOAJ API lookup URLs** from `lookup_urls` when pre-fetched data is available, to prevent the model from re-fetching DOAJ from inside the Docker container (which may be Cloudflare-blocked); DOAJ API URLs are only included when DOAJ pre-fetch returned no result
-- passes known metadata (including `e_issn`, `p_issn`, `issn_l`), prefetched DOAJ data, requested gaps, and direct lookup URLs to the model; when any ISSN is known the prompt includes `scimago_by_issn` as the preferred source for resolving `Alternative journal name`
+- passes known metadata (including `e_issn`, `p_issn`, `issn_l`), prefetched DOAJ/OpenAlex/CrossRef data, requested gaps, and direct lookup URLs to the model; when any ISSN is known the prompt includes `scimago_by_issn` as the preferred source for resolving `Alternative journal name`
 - tells the model to use tools, return JSON only, and stay within the provided existing-journal backlog
-- instructs the model to read `prefetched_doaj_data` before calling any tools: `apc_has_apc=true` with a price is sufficient evidence for Business model='OA' and APC Euros; `apc_has_apc=false` is sufficient evidence for Business model='OA diamond' and APC Euros='0'
+- instructs the model to read `prefetched_doaj_data`, `prefetched_openalex_data`, and `prefetched_crossref_data` before calling any tools: `apc_has_apc=true` with a price is sufficient evidence for Business model='OA' and APC Euros; `apc_has_apc=false` is sufficient evidence for Business model='OA diamond' and APC Euros='0'
 - instructs the model that **Business model requires hard evidence** (explicit text on the journal page, DOAJ, or prefetched_doaj_data) and that inference from publisher reputation is not acceptable
 - instructs the model that **absence of APC mention is not evidence** that APC = 0; only suggest APC Euros = 0 when the source explicitly states no charge, or when `prefetched_doaj_data.apc_has_apc` is false
 - instructs the model to convert non-Euro APC values using approximate current exchange rates
@@ -289,8 +292,10 @@ Per-journal artifacts:
 - `agent/output/logs/enrichment-*.stdout.json`
 - `agent/output/logs/enrichment-*.stderr.log`
 
-## Known Runtime Constraint
+## Known Runtime Constraints
 
-- the current OpenClaw environment may not have a working `web_search` backend; prompts provide direct official-site, DOAJ, and Scimago lookup URLs and `unresolved` is the correct fallback when those sources are insufficient
+- `web_search` inside Docker requires a Brave Search API key (`BRAVE_SEARCH_API_KEY`); without it, the agent uses pre-fetched DOAJ/OpenAlex/CrossRef data and direct `web_fetch` calls instead
+- publisher websites (e.g., Scimago, SAGE, Elsevier) are often protected by Cloudflare WAF and return 403 from Docker datacenter IPs; DOAJ, OpenAlex, and CrossRef APIs (all pre-fetched on the host) bypass this
 - `--skip-download` skips all 10 tab downloads; use it when the `data_extracted/` CSVs are already current
+- journals with only `Institution` / `Institution type` gaps are skipped by the LLM-skip optimization (these fields have never been resolved by the model in practice)
 
