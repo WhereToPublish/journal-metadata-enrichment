@@ -32,9 +32,11 @@ After upload, team members open the `Agent_suggestions` tab and set each row's *
 
 Running **WhereToPublish → Apply Reviewed Suggestions** from the Apps Script menu:
 
-- `approve` rows: the suggested value is written to the journal's field in the appropriate data tab, then the row is moved to `Agent_suggestions_processed`.
-- `reject` rows: the row is moved to `Agent_suggestions_processed` without any data change.
+- `approve` rows: the suggested value is written to the journal's field in the appropriate data tab, then the row is immediately deleted from `Agent_suggestions` and archived in `Agent_suggestions_processed`.
+- `reject` rows: the row is immediately deleted from `Agent_suggestions` and archived in `Agent_suggestions_processed` without any data change.
 - `pending` rows are left untouched.
+
+Each row is deleted from `Agent_suggestions` as soon as it is archived, so if the script is interrupted (e.g. Apps Script timeout), only unprocessed rows remain and the script can be safely re-run.
 
 The `Agent_suggestions_processed` archive contains all reviewed suggestions (approve + reject) and can be used to analyze agent performance over time (see `NEXT_STEPS.md`).
 

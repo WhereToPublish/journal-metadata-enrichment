@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 rm -rf agent/output/
 cd WhereToPublish.github.io
+git reset --hard
 git checkout main
 git fetch origin
 git reset --hard origin/main

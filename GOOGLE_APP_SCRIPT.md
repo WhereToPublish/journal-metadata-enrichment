@@ -29,9 +29,13 @@ The **Status** column is a dropdown with three options: `pending`, `approve`, `r
 ```javascript
 // ApplySuggestions.gs
 // Processes reviewed suggestions from the Agent_suggestions tab:
-//   - "approve" → applies the suggestion to the corresponding data tab + archives
-//   - "reject"  → archives only (no data change)
+//   - "approve" → applies the suggestion to the corresponding data tab, archives the row,
+//                 and immediately deletes it from Agent_suggestions
+//   - "reject"  → archives the row and immediately deletes it (no data change)
 //   - "pending" → left untouched
+//
+// Each row is deleted from Agent_suggestions as soon as it is archived, so a partial run
+// (e.g. script timeout) leaves only unprocessed rows behind and can be safely re-run.
 //
 // Run via: Extensions > WhereToPublish > Apply Reviewed Suggestions
 
@@ -60,6 +64,53 @@ function onOpen() {
     .addToUi();
 }
 
+// Returns the named sheet, creating it with the given header row if it does not exist.
+function getOrCreateTab(ss, tabName, headers) {
+  let tab = ss.getSheetByName(tabName);
+  if (!tab) {
+    tab = ss.insertSheet(tabName);
+    tab.appendRow(headers);
+  }
+  return tab;
+}
+
+// Returns a map of { headerName: columnIndex } from a header array.
+function buildColumnIndex(headers) {
+  const col = {};
+  headers.forEach((h, i) => { col[h] = i; });
+  return col;
+}
+
+// Returns an error string if any required column is missing, otherwise null.
+function validateRequiredColumns(col, required) {
+  for (const r of required) {
+    if (col[r] === undefined) return "Missing column: " + r;
+  }
+  return null;
+}
+
+// Handles the "approve" branch for a single row.
+// Pushes any error message into errors[]. Returns true if the suggestion was applied.
+function processApproval(ss, row, col, errors) {
+  const journalName   = row[col["journal"]];
+  const fieldToUpdate = row[col["field"]];
+  const suggestedVal  = row[col["suggested_value"]];
+  const sugType       = String(row[col["suggestion_type"]] || "").trim();
+
+  if (sugType === "remove") {
+    const msg = applyToDataTab(ss, journalName, "Journal", "FLAGGED_FOR_REMOVAL");
+    if (msg) { errors.push(msg); return false; }
+  } else if (sugType === "add") {
+    errors.push("MANUAL: add journal '" + journalName + "' — cannot auto-add rows yet.");
+    return false;
+  } else {
+    // fill / correct / alt_name
+    const msg = applyToDataTab(ss, journalName, fieldToUpdate, suggestedVal);
+    if (msg) { errors.push(msg); return false; }
+  }
+  return true;
+}
+
 function applyReviewedSuggestions() {
   const ss     = SpreadsheetApp.getActiveSpreadsheet();
   const sugTab = ss.getSheetByName(SUGGESTIONS_TAB);
@@ -70,31 +121,21 @@ function applyReviewedSuggestions() {
 
   const data    = sugTab.getDataRange().getValues();
   const headers = data[0];
+  const col     = buildColumnIndex(headers);
 
-  // Build column-index map from header row
-  const col = {};
-  headers.forEach((h, i) => { col[h] = i; });
-
-  const required = ["Status", "journal", "field", "suggested_value", "suggestion_type"];
-  for (const r of required) {
-    if (col[r] === undefined) {
-      SpreadsheetApp.getUi().alert("Missing column: " + r);
-      return;
-    }
+  const validationError = validateRequiredColumns(col, ["Status", "journal", "field", "suggested_value", "suggestion_type"]);
+  if (validationError) {
+    SpreadsheetApp.getUi().alert(validationError);
+    return;
   }
 
-  // Ensure the processed archive tab exists with a header row
-  let procTab = ss.getSheetByName(PROCESSED_TAB);
-  if (!procTab) {
-    procTab = ss.insertSheet(PROCESSED_TAB);
-    procTab.appendRow(headers);
-  }
+  const procTab = getOrCreateTab(ss, PROCESSED_TAB, headers);
 
   let applied = 0;
   let archived = 0;
   const errors = [];
-  // Collect 1-based row indices to remove from Agent_suggestions (bottom-to-top to preserve indices)
-  const rowsToRemove = [];
+  // Track deletions: each deleted row shifts all subsequent sheet rows up by one.
+  let deletedCount = 0;
 
   for (let i = 1; i < data.length; i++) {
     const row    = data[i];
@@ -103,38 +144,22 @@ function applyReviewedSuggestions() {
     // Only process "approve" and "reject"; leave "pending" untouched
     if (status !== "approve" && status !== "reject") continue;
 
-    const journalName   = row[col["journal"]];
-    const fieldToUpdate = row[col["field"]];
-    const suggestedVal  = row[col["suggested_value"]];
-    const sugType       = String(row[col["suggestion_type"]] || "").trim();
-
     if (status === "approve") {
       try {
-        if (sugType === "remove") {
-          const msg = applyToDataTab(ss, journalName, "Journal", "FLAGGED_FOR_REMOVAL");
-          if (msg) errors.push(msg);
-          else applied++;
-        } else if (sugType === "add") {
-          errors.push("MANUAL: add journal '" + journalName + "' — cannot auto-add rows yet.");
-        } else {
-          // fill / correct / alt_name
-          const msg = applyToDataTab(ss, journalName, fieldToUpdate, suggestedVal);
-          if (msg) errors.push(msg);
-          else applied++;
-        }
+        if (processApproval(ss, row, col, errors)) applied++;
       } catch (e) {
         errors.push("ERROR on row " + (i + 1) + ": " + e.message);
       }
     }
 
-    // Archive the row (approve and reject alike)
+    // Archive then immediately delete from Agent_suggestions.
+    // (i + 1) is the 1-based sheet row for data[i]; subtract deletedCount to account
+    // for rows already removed during this iteration.
     procTab.appendRow(row);
     archived++;
-    rowsToRemove.push(i + 1);  // 1-based sheet row
+    sugTab.deleteRow((i + 1) - deletedCount);
+    deletedCount++;
   }
-
-  // Delete processed rows from Agent_suggestions (bottom-to-top to preserve row indices)
-  rowsToRemove.reverse().forEach(rowNum => sugTab.deleteRow(rowNum));
 
   const summary =
     "Applied: " + applied + " | Archived: " + archived +
@@ -142,8 +167,9 @@ function applyReviewedSuggestions() {
   SpreadsheetApp.getUi().alert("Done!\n\n" + summary);
 }
 
+// Writes newValue into fieldName for all rows matching journalName across all data tabs.
+// Returns an error string if the journal was not found, otherwise null.
 function applyToDataTab(ss, journalName, fieldName, newValue) {
-  // Search all data tabs — the same journal may appear in multiple tabs
   let found = false;
   for (const tabName of Object.values(FIELD_TO_TAB)) {
     const sheet = ss.getSheetByName(tabName);
@@ -167,7 +193,7 @@ function applyToDataTab(ss, journalName, fieldName, newValue) {
   if (!found) {
     return "Journal not found in any tab: '" + journalName + "' (field: " + fieldName + ")";
   }
-  return null;  // success
+  return null;
 }
 ```
 
@@ -181,9 +207,9 @@ function applyToDataTab(ss, journalName, fieldName, newValue) {
 3. Open the spreadsheet → `Agent_suggestions` tab.
 4. For each row: read the `reasoning` and `source_urls`, then set the **Status** dropdown to `approve` or `reject`.
 5. Click **WhereToPublish → Apply Reviewed Suggestions**.
-6. `approve` rows: the suggestion is written to the data tab and the row is moved to `Agent_suggestions_processed`.
-7. `reject` rows: the row is moved to `Agent_suggestions_processed` without any data change.
-8. `pending` rows remain in `Agent_suggestions` for continued review.
+6. `approve` rows: the suggestion is written to the data tab, then the row is immediately deleted from `Agent_suggestions` and archived in `Agent_suggestions_processed`.
+7. `reject` rows: the row is immediately deleted from `Agent_suggestions` and archived in `Agent_suggestions_processed` without any data change.
+8. `pending` rows remain in `Agent_suggestions` for continued review. If the script is interrupted (e.g. timeout), only unprocessed rows remain and the script can be safely re-run.
 9. Trigger the GitHub Actions workflow (or run `bash scripts/run.sh`) to regenerate the website data.
 
 ---

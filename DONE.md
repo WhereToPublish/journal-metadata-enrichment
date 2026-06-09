@@ -249,9 +249,10 @@ The `Agent_suggestions` Google Sheets tab is the staging area for human review.
 - new rows are always uploaded as `pending`
 - team members set the status to `approve` or `reject` after reviewing evidence
 - running **WhereToPublish → Apply Reviewed Suggestions** (Apps Script):
-  - `approve` rows: the suggestion is written to the appropriate data tab, then the row is archived in `Agent_suggestions_processed`
-  - `reject` rows: the row is archived in `Agent_suggestions_processed` without any data change
+  - `approve` rows: the suggestion is written to the appropriate data tab, then the row is immediately deleted from `Agent_suggestions` and archived in `Agent_suggestions_processed`
+  - `reject` rows: the row is immediately deleted from `Agent_suggestions` and archived in `Agent_suggestions_processed` without any data change
   - `pending` rows are left untouched
+  - each row is deleted from `Agent_suggestions` as soon as it is archived; if the script times out, only unprocessed rows remain and the run can be safely retried
 - the `Agent_suggestions_processed` tab accumulates all reviewed suggestions for performance analysis (see `NEXT_STEPS.md`)
 
 ## Persistence Contract
