@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import sys
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
@@ -16,7 +14,7 @@ if str(WTP_SCRIPTS_DIR) not in sys.path:
 
 import sheets_client
 from libraries import format_issn, norm_name
-from update_extracted import (
+from issn_lookups import (
     load_doaj_issn_title_lookup,
     load_openapc_issn_title_lookup,
     load_scimago_issn_title_lookup,
@@ -33,7 +31,7 @@ PRESENCE_COLUMNS = ("Present in Scimago", "Present in DOAJ", "Present in openAPC
 @dataclass(frozen=True)
 class SourceConfig:
     name: str
-    loader: Callable[[], dict[str, list[str]]]
+    loader: Callable[[Path], dict[str, list[str]]]
     url_builder: Callable[[str], str]
 
 
@@ -54,16 +52,6 @@ SOURCE_PRIORITY = (
         url_builder=lambda issn: "https://treemaps.intact-project.org/apcdata/openapc/",
     ),
 )
-
-
-@contextmanager
-def working_directory(path: Path) -> Iterator[None]:
-    previous_cwd = Path.cwd()
-    os.chdir(path)
-    try:
-        yield
-    finally:
-        os.chdir(previous_cwd)
 
 
 def load_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -102,12 +90,7 @@ def needs_alt_name_suggestion(row: dict[str, str]) -> bool:
 
 
 def load_source_lookups(wtp_dir: Path) -> list[tuple[SourceConfig, dict[str, list[str]]]]:
-    lookups: list[tuple[SourceConfig, dict[str, list[str]]]] = []
-    with working_directory(wtp_dir):
-        for source in SOURCE_PRIORITY:
-            lookup = source.loader()
-            lookups.append((source, lookup))
-    return lookups
+    return [(source, source.loader(wtp_dir)) for source in SOURCE_PRIORITY]
 
 
 def resolve_source_match(
@@ -199,7 +182,7 @@ def main() -> None:
         "--wtp-dir",
         type=Path,
         default=DEFAULT_WTP_DIR,
-        help=f"Path to the WhereToPublish.github.io checkout (default: {DEFAULT_WTP_DIR})",
+        help=f"Path to the WhereToPublish repo (default: {DEFAULT_WTP_DIR})",
     )
     parser.add_argument(
         "--output",

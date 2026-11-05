@@ -1,7 +1,8 @@
 """gap_analysis.py — Run the WhereToPublish data pipeline and identify metadata gaps.
 
 This script:
-1. Verifies that required external data files are present in the WhereToPublish project.
+1. Verifies that required external data files are present in the WhereToPublish project
+   (the parent repository of this project).
 2. Downloads all Google Sheets tabs (every field slug in SHEET_TAB_NAMES) via the Sheets API.
 3. Runs update_extracted.py then data_process.py (the existing WTP pipeline).
 4. Reads the post-enrichment data/<slug>.csv for every tab.
@@ -11,13 +12,13 @@ This script:
 The external data files (Scimago, DOAJ, OpenAPC, PCI, Dataverse) must already be present
 in the WhereToPublish project's data_extraction/ directory. Run
     bash scripts/download_extraction.sh
-from the WhereToPublish.github.io repository to populate them.
+from the WhereToPublish repository root to populate them.
 
 Run from the journal-metadata-enrichment/ project root:
     python3 agent/scripts/gap_analysis.py
 
 Or with an explicit WTP repo path:
-    python3 agent/scripts/gap_analysis.py --wtp-dir /path/to/WhereToPublish.github.io
+    python3 agent/scripts/gap_analysis.py --wtp-dir /path/to/WhereToPublish
 """
 
 import argparse
@@ -29,23 +30,22 @@ from pathlib import Path
 from datetime import date, datetime
 
 # Resolve the WTP scripts directory before importing sheets_client so we always
-# use the canonical implementation in WhereToPublish.github.io/scripts/ rather
-# than a duplicate copy inside the agent folder.
-WTP_SCRIPTS = Path(__file__).parent.parent.parent / "WhereToPublish.github.io" / "scripts"
-if str(WTP_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(WTP_SCRIPTS))
+# use the canonical implementation in the parent WhereToPublish repo's scripts/
+# rather than a duplicate copy inside the agent folder.
+from enrichment_common import (
+    DEFAULT_WTP_DIR,
+    OUTPUT_DIR,
+    WTP_SCRIPTS_DIR,
+    is_empty,
+)
+
+if str(WTP_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(WTP_SCRIPTS_DIR))
 import sheets_client as _sheets_client
 
-from enrichment_common import is_empty
-
 # ---------------------------------------------------------------------------
-# Paths and constants
+# Constants
 # ---------------------------------------------------------------------------
-
-SCRIPT_DIR = Path(__file__).parent
-PROJECT_ROOT = Path(".")
-OUTPUT_DIR = PROJECT_ROOT / "agent" / "output"
-DEFAULT_WTP_DIR = PROJECT_ROOT / "WhereToPublish.github.io"
 
 # Files that must exist in data_extraction/ for the WTP pipeline to run correctly.
 # These are managed by the WhereToPublish project (scripts/download_extraction.sh).
@@ -54,7 +54,7 @@ REQUIRED_EXTRACTION_FILES = [
     "DOAJ.csv.gz",
     "scimagojr.csv.gz",
     "PCI_friendly.csv.gz",
-    "APC_dataverse.txt.gz",
+    "scholcommlab_apc_dataset_2019_2025-2.csv.gz",
 ]
 
 # Field priority weights — higher = more important to fill
@@ -101,7 +101,7 @@ def verify_extraction_data(wtp_dir: Path) -> None:
         log(f"ERROR: Required extraction files not found in {display_path(data_extraction)}:")
         for f in missing:
             log(f"  missing: {f}")
-        log("Run 'bash scripts/download_extraction.sh' from the WhereToPublish.github.io repo to populate them.")
+        log("Run 'bash scripts/download_extraction.sh' from the WhereToPublish repo root to populate them.")
         sys.exit(1)
     log(f"  Extraction data: all {len(REQUIRED_EXTRACTION_FILES)} required files present")
 
@@ -345,7 +345,7 @@ def main() -> None:
         "--wtp-dir",
         type=Path,
         default=DEFAULT_WTP_DIR,
-        help=f"Path to the WhereToPublish.github.io repo (default: {DEFAULT_WTP_DIR})",
+        help=f"Path to the WhereToPublish repo (default: {DEFAULT_WTP_DIR})",
     )
     parser.add_argument(
         "--skip-download",

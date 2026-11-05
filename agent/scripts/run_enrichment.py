@@ -3,22 +3,43 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
-from pathlib import Path
+import json
 import re
 import subprocess
 import sys
 import urllib.parse
 import urllib.request
+from pathlib import Path
+from typing import Any
 
 # Resolve the WTP scripts directory before importing sheets_client so we always
-# use the canonical implementation in WhereToPublish.github.io/scripts/ rather
-# than a duplicate copy inside the agent folder.
-WTP_SCRIPTS = Path(__file__).parent.parent.parent / "WhereToPublish.github.io" / "scripts"
-if str(WTP_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(WTP_SCRIPTS))
+# use the canonical implementation in the parent WhereToPublish repo's scripts/
+# rather than a duplicate copy inside the agent folder.
+from enrichment_common import (
+    DEFAULT_WTP_DIR,
+    GAP_ANALYSIS_SCRIPT,
+    GAP_REPORT_PATH,
+    LOGS_DIR,
+    RUN_STATE_PATH,
+    STATE_DIR,
+    SUGGESTIONS_CSV_PATH,
+    WTP_SCRIPTS_DIR,
+    slugify,
+)
+
+if str(WTP_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(WTP_SCRIPTS_DIR))
 import sheets_client
-from openclaw_runtime import DEFAULT_OPENCLAW_TIMEOUT_SECONDS, OpenClawRunner
-from suggestions_io import *
+from omp_runtime import DEFAULT_AGENT_TIMEOUT_SECONDS, OMPRunner
+from suggestions_io import (
+    append_suggestions,
+    init_suggestions_csv,
+    load_existing_keys,
+    load_state,
+    sanitize_agent_result,
+    save_state,
+    write_checkpoint,
+)
 
 
 def load_suggestion_keys_from_tabs(service: Any, tab_names: list[str],
@@ -141,7 +162,7 @@ def fetch_openalex_data(issn: str) -> dict[str, Any] | None:
     """Pre-fetch OpenAlex data for a journal by ISSN.
 
     OpenAlex is a public academic metadata service that is not blocked from
-    Docker containers. It provides APC data in multiple currencies (including EUR),
+    any network-restricted environment. It provides APC data in multiple currencies (including EUR),
     OA status, and publisher — useful as a fallback when DOAJ has no entry and
     publisher websites return 403.
 
@@ -200,7 +221,7 @@ def fetch_crossref_data(journal_name: str) -> dict[str, Any] | None:
     """Pre-fetch CrossRef data for a journal by title.
 
     CrossRef is a public DOI registration agency that maintains ISSN records
-    for journals. It's accessible from Docker containers and provides p-ISSN
+    for journals. It's publicly accessible and provides p-ISSN
     and e-ISSN for most journals — useful when DOAJ and official websites are
     unavailable.
 
@@ -403,6 +424,10 @@ def build_prompt(journal_gap: dict[str, Any], doaj_data: dict[str, Any] | None =
             "  - If source='works', ISSN type classification (print/electronic) is less reliable — treat p_issn/e_issn as approximate; all_issns lists the raw ISSNs\n"
             "  - Do NOT use p_issn/e_issn as the Alternative journal name — they are ISSN values, not journal titles\n"
             "After extracting data from prefetched_doaj_data, prefetched_openalex_data, and prefetched_crossref_data, use the fetch tool ONLY for gaps that still need evidence.\n"
+            "If a suggestion is based on prefetched data, cite the corresponding prefetch API URL in source_urls: "
+            "DOAJ API https://doaj.org/api/v3/search/journals/issn:<issn>, "
+            "OpenAlex API https://api.openalex.org/sources?filter=issn:<issn>, "
+            "CrossRef API https://api.crossref.org/journals?query=<journal name>.\n"
             "Use the available tools in this run, including web search and page fetch tools, to gather evidence.\n"
             "If web search is unavailable, use the provided lookup URLs directly with the fetch tool before falling back to other public sources.\n"
             "Do not write or edit files in this run; return structured JSON only.\n"
@@ -488,13 +513,13 @@ def main() -> None:
     parser.add_argument("--log-dir", type=Path, default=LOGS_DIR)
     parser.add_argument("--skip-gap-analysis", action="store_true")
     parser.add_argument("--journal", default="", help="Only process a single journal by exact name.")
-    parser.add_argument("--max-suggestions", type=int, default=5,
-                        help="Stop after this many valid suggestions are written.")
+    parser.add_argument("--max-suggestions", type=int, default=15,
+                        help="Stop after this many valid suggestions are written (default: 15).")
     parser.add_argument(
-        "--openclaw-timeout-seconds",
+        "--agent-timeout-seconds",
         type=int,
-        default=DEFAULT_OPENCLAW_TIMEOUT_SECONDS,
-        help="Per-journal timeout for openclaw agent runs (default: 900).",
+        default=DEFAULT_AGENT_TIMEOUT_SECONDS,
+        help="Per-journal timeout for OMP agent runs (default: 900).",
     )
     parser.add_argument(
         "--credentials",
@@ -504,8 +529,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.openclaw_timeout_seconds < 1:
-        parser.error("--openclaw-timeout-seconds must be a positive integer")
+    if args.agent_timeout_seconds < 1:
+        parser.error("--agent-timeout-seconds must be a positive integer")
     if args.skip_gap_analysis and not args.gap_report.exists():
         parser.error(
             f"--skip-gap-analysis requires an existing gap report at {args.gap_report}"
@@ -537,7 +562,7 @@ def main() -> None:
         log("Skipping gap analysis (--skip-gap-analysis set)")
 
     report = load_gap_report(args.gap_report)
-    runner = OpenClawRunner(args.log_dir, timeout_seconds=args.openclaw_timeout_seconds)
+    runner = OMPRunner(args.log_dir, timeout_seconds=args.agent_timeout_seconds)
 
     # Sort all journals by their highest-priority gap (high → medium → low).
     journals = sorted(report["journals"], key=journal_max_priority)

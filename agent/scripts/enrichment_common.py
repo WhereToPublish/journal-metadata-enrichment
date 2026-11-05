@@ -10,8 +10,15 @@ AGENT_DIR = PROJECT_ROOT / "agent"
 OUTPUT_DIR = AGENT_DIR / "output"
 LOGS_DIR = OUTPUT_DIR / "logs"
 STATE_DIR = OUTPUT_DIR / "state"
-DEFAULT_WTP_DIR = PROJECT_ROOT / "WhereToPublish.github.io"
+
+# This project lives inside the WhereToPublish repository, so the WTP repo
+# root is simply the parent directory of the project root.
+DEFAULT_WTP_DIR = PROJECT_ROOT.parent
 WTP_SCRIPTS_DIR = DEFAULT_WTP_DIR / "scripts"
+
+# System prompt handed to the OMP agent for every per-journal run.
+SYSTEM_PROMPT_PATH = AGENT_DIR / "prompt" / "system.md"
+
 GAP_REPORT_PATH = OUTPUT_DIR / "gap_report.json"
 SUGGESTIONS_CSV_PATH = OUTPUT_DIR / "Agent_suggestions.csv"
 RUN_STATE_PATH = STATE_DIR / "run_state.json"
@@ -47,8 +54,6 @@ ALLOWED_FIELDS = {
 ALLOWED_PRIORITIES = {"high", "medium", "low"}
 ALLOWED_SUGGESTION_TYPES = {"fill", "alt_name", "correct", "remove"}
 ALLOWED_BUSINESS_MODELS = {"OA diamond", "OA", "Hybrid", "Subscription"}
-
-DEFAULT_MODEL = "ollama/qwen2.5:14b-ctx128k"
 
 
 def slugify(value: str) -> str:

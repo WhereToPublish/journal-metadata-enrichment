@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
+from pathlib import Path
 from typing import Any
-from enrichment_common import *
+
+from enrichment_common import (
+    ALLOWED_BUSINESS_MODELS,
+    ALLOWED_FIELDS,
+    ALLOWED_PRIORITIES,
+    ALLOWED_SUGGESTION_TYPES,
+    CSV_HEADERS,
+    WTP_SCRIPTS_DIR,
+)
 
 if str(WTP_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(WTP_SCRIPTS_DIR))

@@ -214,23 +214,18 @@ function applyToDataTab(ss, journalName, fieldName, newValue) {
 
 ---
 
-## OpenClaw Model Configuration
+## OMP (oh-my-pi) Model Configuration
 
-Set the primary model for the agent (run once):
-
-```bash
-# Recommended for 32 GB M2 — best reasoning quality
-openclaw config set agents.defaults.model.primary ollama/qwen2.5:32b
-
-# Alternative — faster, good for agentic multi-step tasks
-# openclaw config set agents.defaults.model.primary ollama/qwen3:30b-a3b
-
-# Fallback to cloud if local model is unavailable (optional)
-# openclaw config set agents.defaults.model.fallbacks '["anthropic/claude-sonnet-4-6"]'
-```
-
-Ensure Ollama has the model pulled:
+The agent is OMP (oh-my-pi), already installed on the host and plugged to an LLM
+(see `~/.omp/agent/config.yml`). The default model is configured there; override
+it for a single run without touching the config:
 
 ```bash
-ollama pull qwen2.5:32b   # ~19 GB download
+# Override the model for one run
+JOURNALMIND_MODEL=<model> ./run_agent.sh
+
+# Or pass the OMP flag directly
+omp --model <model> -p "hello"
 ```
+
+List the available models with `omp models`.

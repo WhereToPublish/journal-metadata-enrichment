@@ -59,7 +59,7 @@ detection to confidence down-scoring; update prompt constraints.
 
 ## 4. Model Comparison Across Runs
 
-**Goal**: Compare the approval rates of different Ollama models to guide model selection.
+**Goal**: Compare the approval rates of different OMP (oh-my-pi) models to guide model selection.
 
 - Tag each batch of suggestions with the model name used (the `run_state.json` records
   `session_id`; add a `model` field to session state for traceability).
@@ -90,7 +90,7 @@ directly from the reviewed history.
 Once the history is large enough (≥ 500 reviewed suggestions across fields):
 
 - Export `(prompt, approved_JSON_output)` pairs from approved runs.
-- Use them as supervised fine-tuning data for a local Ollama model.
+- Use them as supervised fine-tuning data for a model reachable through OMP.
 - Track approval rates before and after fine-tuning to measure improvement.
 
 **Actionable outcome**: A domain-adapted model that requires less human correction per run.
@@ -119,7 +119,7 @@ To enable the analyses above, add the following columns when they are missing:
 
 | Column          | Where          | Notes                                       |
 | --------------- | -------------- | ------------------------------------------- |
-| `model`         | run_state.json | The Ollama model tag used for the session   |
+| `model`         | run_state.json | The OMP model used for the session          |
 | `reviewed_at`   | processed tab  | Timestamp when the row was approved/rejected|
 | `reviewer`      | processed tab  | Optional: who reviewed (for team workflows) |
 

@@ -1,3 +1,17 @@
+"""omp_runtime.py — OMP (oh-my-pi) agent wrapper.
+
+Each journal is researched by one non-interactive OMP run on the host:
+
+    omp -p <prompt> --mode json --no-session --auto-approve --thinking off \
+        --append-system-prompt @agent/prompt/system.md --max-time <seconds>
+
+OMP is already installed on the host and plugged to an LLM (see
+~/.omp/agent/config.yml); no Docker container and no local Ollama model are
+involved anymore.  The JSONL event stream printed on stdout is parsed to
+recover the final assistant text, from which the suggestion JSON object is
+extracted.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,23 +20,17 @@ import os
 from pathlib import Path
 import signal
 import subprocess
-import time
-from typing import Any, cast
+from typing import Any
 
-from enrichment_common import DEFAULT_MODEL, OUTPUT_DIR
+from enrichment_common import PROJECT_ROOT, SYSTEM_PROMPT_PATH
 
-DOCKER_IMAGE = "journalmind-openclaw"
-# Inside the container agent/output is mounted at /data/output.
-# Session JSONL files are written to /data/output/state/openclaw-sessions,
-# which maps to OUTPUT_DIR/state/openclaw-sessions on the host.
-_CONTAINER_OUTPUT_DIR = "/data/output"
-_CONTAINER_STATE_DIR = f"{_CONTAINER_OUTPUT_DIR}/state/openclaw-sessions"
+OMP_COMMAND = os.environ.get("JOURNALMIND_OMP_COMMAND", "omp")
 
-
-DEFAULT_OPENCLAW_TIMEOUT_SECONDS = 900
-DEFAULT_OPENCLAW_MAX_ATTEMPTS = 2
-DEFAULT_POLL_INTERVAL_SECONDS = 1.0
-DEFAULT_PROCESS_STOP_GRACE_SECONDS = 2.0
+DEFAULT_AGENT_TIMEOUT_SECONDS = 900
+DEFAULT_MAX_ATTEMPTS = 2
+DEFAULT_PROCESS_STOP_GRACE_SECONDS = 5.0
+# Extra seconds granted on top of --max-time before we kill the process.
+_KILL_GRACE_SECONDS = 30.0
 
 
 def _strip_json_line_comments(text: str) -> str:
@@ -96,7 +104,6 @@ class AgentRunResult:
     session_id: str
     stdout: str
     stderr: str
-    response_json: dict[str, Any] | None
     payload_text: str
     parsed_payload: dict[str, Any] | None
 
@@ -106,7 +113,6 @@ class RunArtifacts:
     prompt_path: Path
     stdout_path: Path
     stderr_path: Path
-    session_path: Path
 
 
 def _build_retry_prompt(prompt: str, previous_response: str = "") -> str:
@@ -148,86 +154,60 @@ def _build_retry_prompt(prompt: str, previous_response: str = "") -> str:
     )
 
 
-def _build_docker_command(
-    session_id: str,
+def _build_omp_command(
     prompt: str,
     timeout_seconds: int,
-    output_dir: Path,
-    model: str,
-    image: str = DOCKER_IMAGE,
+    model: str | None,
 ) -> list[str]:
-    return [
-        "docker", "run", "--rm",
-        "-v", f"{output_dir}:{_CONTAINER_OUTPUT_DIR}",
-        "-e", f"OPENCLAW_STATE_DIR={_CONTAINER_STATE_DIR}",
-        "-e", f"JOURNALMIND_MODEL={model}",
-        "-e", "OLLAMA_API_KEY=ollama-local",
-        "--add-host", "host.docker.internal:host-gateway",
-        image,
-        "openclaw", "agent", "--local",
-        "--session-id", session_id,
-        "--message", prompt,
+    command = [
+        OMP_COMMAND,
+        "-p", prompt,
+        "--mode", "json",
+        "--no-session",
+        "--auto-approve",
         "--thinking", "off",
-        "--json",
-        "--timeout", str(timeout_seconds),
+        "--append-system-prompt", f"@{SYSTEM_PROMPT_PATH}",
+        "--max-time", str(timeout_seconds),
     ]
+    if model:
+        command += ["--model", model]
+    return command
 
 
-def _build_run_artifacts(log_dir: Path, state_dir: Path, session_id: str) -> RunArtifacts:
+def _build_run_artifacts(log_dir: Path, session_id: str) -> RunArtifacts:
     return RunArtifacts(
         prompt_path=log_dir / f"{session_id}.prompt.txt",
         stdout_path=log_dir / f"{session_id}.stdout.json",
         stderr_path=log_dir / f"{session_id}.stderr.log",
-        session_path=state_dir / "agents" / "main" / "sessions" / f"{session_id}.jsonl",
     )
 
 
-def _extract_session_payload(session_file: Path) -> tuple[str, dict[str, Any] | None] | None:
-    if not session_file.exists():
-        return None
-
-    payload_text = ""
-    try:
-        lines = session_file.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return None
-
-    for line in lines:
+def _assistant_texts_from_jsonl(stdout: str) -> list[str]:
+    """Return the text of every completed assistant message in an OMP JSONL stream."""
+    texts: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-
-        if event.get("type") != "message":
+        if event.get("type") != "message_end":
             continue
-        message = cast(dict[str, Any] | None, event.get("message"))
-        if not isinstance(message, dict):
+        message = event.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        message_data = message
-        if cast(str | None, message_data.get("role")) != "assistant":
-            continue
-        if cast(str | None, message_data.get("stopReason")) != "stop":
-            continue
-
-        content = cast(list[Any] | None, message_data.get("content"))
+        content = message.get("content")
         if not isinstance(content, list):
             continue
-
-        text_blocks: list[str] = []
+        blocks: list[str] = []
         for block in content:
-            if not isinstance(block, dict):
-                continue
-            block_data = cast(dict[str, Any], block)
-            text = cast(str | None, block_data.get("text"))
-            if text:
-                text_blocks.append(text)
-
-        if text_blocks:
-            payload_text = "\n".join(block for block in text_blocks if block)
-
-    if not payload_text:
-        return None
-    return payload_text, _extract_json_block(payload_text)
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                blocks.append(str(block["text"]))
+        if blocks:
+            texts.append("\n".join(blocks))
+    return texts
 
 
 def _stop_process(process: subprocess.Popen[str],
@@ -260,46 +240,9 @@ def _stop_process(process: subprocess.Popen[str],
     return stdout, stderr
 
 
-def _parse_response_json(stdout: str) -> dict[str, Any] | None:
-    if not stdout.strip():
-        return None
-    # The Docker entrypoint emits status lines before the CLI JSON; try strict
-    # parse first, then fall back to scanning for the JSON object.
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError:
-        return _extract_json_block(stdout)
-
-
-def _extract_cli_payload(response_json: dict[str, Any] | None) -> tuple[str, dict[str, Any] | None]:
-    if not response_json:
-        return "", None
-
-    result = response_json.get("result", response_json)
-    if not isinstance(result, dict):
-        return "", None
-    result_data = cast(dict[str, Any], result)
-
-    raw_payloads = cast(list[Any] | None, result_data.get("payloads"))
-    if not isinstance(raw_payloads, list):
-        return "", None
-
-    payload_text_parts: list[str] = []
-    for raw_payload in raw_payloads:
-        if not isinstance(raw_payload, dict):
-            continue
-        payload_data = cast(dict[str, Any], raw_payload)
-        text = cast(str | None, payload_data.get("text"))
-        if text:
-            payload_text_parts.append(text)
-
-    payload_text = "\n".join(payload_text_parts)
-    return payload_text, _extract_json_block(payload_text)
-
-
 def _build_timeout_result(session_id: str, stdout: str, stderr: str,
                           timeout_seconds: int) -> AgentRunResult:
-    timeout_note = f"openclaw agent timed out after {timeout_seconds}s"
+    timeout_note = f"omp agent timed out after {timeout_seconds}s"
     timed_out_stderr = f"{stderr}\n{timeout_note}".strip()
     synthetic: dict[str, Any] = {
         "journal": "",
@@ -311,54 +254,21 @@ def _build_timeout_result(session_id: str, stdout: str, stderr: str,
         session_id=session_id,
         stdout=stdout,
         stderr=timed_out_stderr,
-        response_json=None,
         payload_text="",
         parsed_payload=synthetic,
     )
 
 
-def _wait_for_process(process: subprocess.Popen[str], session_path: Path,
-                      timeout_seconds: int) -> tuple[str, str, str, dict[str, Any] | None, bool]:
-    deadline = time.monotonic() + timeout_seconds
-    session_payload_text = ""
-    session_parsed_payload: dict[str, Any] | None = None
+class OMPRunner:
+    """Runs one OMP (oh-my-pi) non-interactive session per journal."""
 
-    while True:
-        if process.poll() is not None:
-            stdout, stderr = process.communicate()
-            # Final session check — the JSONL is written just before the process
-            # exits, so polling may have missed it in the last interval.
-            if session_parsed_payload is None:
-                session_payload = _extract_session_payload(session_path)
-                if session_payload is not None:
-                    session_payload_text, session_parsed_payload = session_payload
-            return stdout, stderr, session_payload_text, session_parsed_payload, False
-
-        session_payload = _extract_session_payload(session_path)
-        if session_payload is not None:
-            session_payload_text, session_parsed_payload = session_payload
-            if session_parsed_payload is not None:
-                stdout, stderr = _stop_process(process)
-                return stdout, stderr, session_payload_text, session_parsed_payload, False
-
-        if time.monotonic() >= deadline:
-            stdout, stderr = _stop_process(process)
-            if session_parsed_payload is None:
-                session_payload = _extract_session_payload(session_path)
-                if session_payload is not None:
-                    session_payload_text, session_parsed_payload = session_payload
-            return stdout, stderr, session_payload_text, session_parsed_payload, session_parsed_payload is None
-
-        time.sleep(DEFAULT_POLL_INTERVAL_SECONDS)
-
-
-class OpenClawRunner:
     def __init__(self, log_dir: Path,
-                 timeout_seconds: int = DEFAULT_OPENCLAW_TIMEOUT_SECONDS,
-                 max_attempts: int = DEFAULT_OPENCLAW_MAX_ATTEMPTS) -> None:
+                 timeout_seconds: int = DEFAULT_AGENT_TIMEOUT_SECONDS,
+                 max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+                 model: str | None = None) -> None:
         self.log_dir = log_dir
-        self.model = os.environ.get("JOURNALMIND_MODEL", DEFAULT_MODEL)
-        self.state_dir = OUTPUT_DIR / "state" / "openclaw-sessions"
+        # JOURNALMIND_MODEL overrides the model configured in OMP itself.
+        self.model = model or os.environ.get("JOURNALMIND_MODEL") or None
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -366,46 +276,48 @@ class OpenClawRunner:
     def _run_once(self, session_id: str, prompt: str,
                   timeout_seconds: int | None = None) -> AgentRunResult:
         effective_timeout_seconds = self.timeout_seconds if timeout_seconds is None else timeout_seconds
-        artifacts = _build_run_artifacts(self.log_dir, self.state_dir, session_id)
+        artifacts = _build_run_artifacts(self.log_dir, session_id)
         artifacts.prompt_path.write_text(prompt, encoding="utf-8")
 
         process = subprocess.Popen(
-            _build_docker_command(session_id, prompt, effective_timeout_seconds, OUTPUT_DIR, self.model),
+            _build_omp_command(prompt, effective_timeout_seconds, self.model),
+            cwd=PROJECT_ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
         )
 
-        stdout, stderr, session_payload_text, session_parsed_payload, timed_out = _wait_for_process(
-            process,
-            artifacts.session_path,
-            effective_timeout_seconds,
-        )
+        try:
+            stdout, stderr = process.communicate(
+                timeout=effective_timeout_seconds + _KILL_GRACE_SECONDS
+            )
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            stdout, stderr = _stop_process(process)
+            timed_out = True
 
         if timed_out:
-            timeout_result = _build_timeout_result(session_id, stdout, stderr, effective_timeout_seconds)
-            artifacts.stdout_path.write_text(timeout_result.stdout, encoding="utf-8")
-            artifacts.stderr_path.write_text(timeout_result.stderr, encoding="utf-8")
-            return timeout_result
+            result = _build_timeout_result(session_id, stdout, stderr, effective_timeout_seconds)
+        else:
+            result = AgentRunResult(
+                session_id=session_id,
+                stdout=stdout,
+                stderr=stderr,
+                payload_text="",
+                parsed_payload=None,
+            )
 
-        artifacts.stdout_path.write_text(stdout, encoding="utf-8")
-        artifacts.stderr_path.write_text(stderr, encoding="utf-8")
+        artifacts.stdout_path.write_text(result.stdout, encoding="utf-8")
+        artifacts.stderr_path.write_text(result.stderr, encoding="utf-8")
 
-        response_json = _parse_response_json(stdout)
-        payload_text, parsed_payload = _extract_cli_payload(response_json)
-        if parsed_payload is None and session_parsed_payload is not None:
-            payload_text = session_payload_text
-            parsed_payload = session_parsed_payload
+        if not timed_out:
+            texts = _assistant_texts_from_jsonl(result.stdout)
+            if texts:
+                result.payload_text = texts[-1]
+                result.parsed_payload = _extract_json_block(result.payload_text)
 
-        return AgentRunResult(
-            session_id=session_id,
-            stdout=stdout,
-            stderr=stderr,
-            response_json=response_json,
-            payload_text=payload_text,
-            parsed_payload=parsed_payload,
-        )
+        return result
 
     def run(self, session_id: str, prompt: str,
             timeout_seconds: int | None = None,

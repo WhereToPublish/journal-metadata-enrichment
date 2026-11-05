@@ -18,13 +18,13 @@ import sys
 from pathlib import Path
 
 # Resolve the WTP scripts directory before importing sheets_client so we always
-# use the canonical implementation in WhereToPublish.github.io/scripts/ rather
-# than a duplicate copy inside the agent folder.
-WTP_SCRIPTS = Path(__file__).parent.parent.parent / "WhereToPublish.github.io" / "scripts"
-if str(WTP_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(WTP_SCRIPTS))
+# use the canonical implementation in the parent WhereToPublish repo's scripts/
+# rather than a duplicate copy inside the agent folder.
+from enrichment_common import SUGGESTIONS_CSV_PATH, WTP_SCRIPTS_DIR
+
+if str(WTP_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(WTP_SCRIPTS_DIR))
 import sheets_client
-from enrichment_common import SUGGESTIONS_CSV_PATH
 from suggestions_io import dedupe_suggestions, load_suggestions, write_suggestions
 
 SUGGESTIONS_TAB = "Agent_suggestions"
