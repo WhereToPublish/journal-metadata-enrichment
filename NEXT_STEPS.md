@@ -59,15 +59,20 @@ detection to confidence down-scoring; update prompt constraints.
 
 ## 4. Model Comparison Across Runs
 
-**Goal**: Compare the approval rates of different OMP (oh-my-pi) models to guide model selection.
+**Goal**: Compare the approval rates of different models (and runtimes) to guide model selection.
 
-- Tag each batch of suggestions with the model name used (the `run_state.json` records
-  `session_id`; add a `model` field to session state for traceability).
-- After several runs with different models, compare approval rates, rejection rates, and
+- Both runtimes and their models are candidates: OMP's configured LLM, and the Mistral
+  runtime's `JOURNALMIND_MISTRAL_MODEL` (e.g. `ministral-3b-latest` vs `mistral-small-latest`).
+- Tag each batch of suggestions with the runtime and model used (the `run_state.json` records
+  `session_id`; add a `runtime` and `model` field to session state for traceability).
+- Run the same small batch against the same `--gap-report` with different settings
+  (`--runtime omp` vs `--runtime mistral`, different `JOURNALMIND_*_MODEL` overrides), upload
+  both result sets, and compare through the review workflow.
+- After several runs, compare approval rates, rejection rates, and
   the distribution of unresolved journals per model.
 
-**Actionable outcome**: Choose the model with the best approval-rate / cost / speed trade-off
-for routine overnight runs.
+**Actionable outcome**: Choose the runtime + model with the best approval-rate / cost / speed
+trade-off for routine runs.
 
 ---
 

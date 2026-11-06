@@ -25,12 +25,14 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import os
 import subprocess
 import sys
 import urllib.parse
 from pathlib import Path
 from typing import Any
 
+from agent_result import parse_result_file
 from enrichment_common import (
     DEFAULT_WTP_DIR,
     GAP_ANALYSIS_SCRIPT,
@@ -50,6 +52,7 @@ if str(WTP_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(WTP_SCRIPTS_DIR))
 import sheets_client
 from omp_runtime import DEFAULT_SWARM_TIMEOUT_SECONDS, OMPSwarmRunner
+from mistral_runtime import MistralSwarmRunner
 from issn_alt_name_suggestions import append_deterministic_suggestions
 from suggestions_io import (
     append_suggestions,
@@ -275,13 +278,9 @@ def build_orchestrator_prompt(mission_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 # Result collection
 # ---------------------------------------------------------------------------
-
-def parse_result_file(result_file: Path) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(result_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
+# parse_result_file / write_result_file live in agent_result.py: every result
+# file (OMP-subagent-written or Mistral-runtime-written) is validated through
+# the same Pydantic AgentResult model before it reaches sanitize_agent_result.
 
 
 def harvest_previous_results(
@@ -308,18 +307,18 @@ def harvest_previous_results(
     journals_by_name = {j["name"]: j for j in report_journals}
     harvested = 0
     for result_file in sorted(SWARM_DIR.glob("*/results/*.json")):
-        payload = parse_result_file(result_file)
-        if payload is None:
+        result = parse_result_file(result_file)
+        if result is None:
             continue
-        journal_name = str(payload.get("journal", "")).strip()
+        journal_name = result.journal
         journal_gap = journals_by_name.get(journal_name)
-        if not journal_name or journal_gap is None or journal_name in processed_names:
+        if journal_gap is None or journal_name in processed_names:
             continue
 
         status, rows, notes = sanitize_agent_result(
             journal_name=journal_name,
             journal_gap=journal_gap,
-            agent_result=payload,
+            agent_result=result,
             existing_keys=existing_keys,
         )
         append_suggestions(output, rows)
@@ -379,7 +378,12 @@ def load_gap_report(path: Path) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run JournalMind enrichment as a swarm of OMP subagents.")
+    parser = argparse.ArgumentParser(description="Run JournalMind enrichment (OMP swarm or Mistral Agents SDK runtime).")
+    parser.add_argument("--runtime", choices=("omp", "mistral"), default=os.environ.get("JOURNALMIND_RUNTIME", "omp"),
+                        help="Agent runtime: 'omp' (oh-my-pi swarm orchestrator) or 'mistral' "
+                             "(Mistral Agents SDK, one agent per journal). Default: JOURNALMIND_RUNTIME env, else 'omp'.")
+    parser.add_argument("--mistral-model", default=None,
+                        help="Mistral model for the mistral runtime (default: JOURNALMIND_MISTRAL_MODEL env, else ministral-3b-latest).")
     parser.add_argument("--wtp-dir", type=Path, default=DEFAULT_WTP_DIR)
     parser.add_argument("--gap-report", type=Path, default=GAP_REPORT_PATH)
     parser.add_argument("--output", type=Path, default=SUGGESTIONS_CSV_PATH)
@@ -392,9 +396,9 @@ def main() -> None:
     parser.add_argument("--max-suggestions", type=int, default=15,
                         help="Stop after this many valid suggestions are written (default: 15).")
     parser.add_argument("--swarm-size", type=int, default=32,
-                        help="Journals per OMP swarm run — max 32 parallel subagents (default: 32).")
+                        help="Journals per batch (default: 32).")
     parser.add_argument("--swarm-timeout-seconds", type=int, default=DEFAULT_SWARM_TIMEOUT_SECONDS,
-                        help="Timeout for each OMP swarm run (default: 1800).")
+                        help="Per-batch timeout: OMP swarm run / Mistral batch budget (default: 3600).")
     parser.add_argument("--credentials", type=Path, default=None,
                         help="Path to service-account JSON key (default: GOOGLE_SERVICE_ACCOUNT_KEY env var or default path).")
     args = parser.parse_args()
@@ -402,7 +406,7 @@ def main() -> None:
     if args.swarm_timeout_seconds < 1:
         parser.error("--swarm-timeout-seconds must be a positive integer")
     if not 1 <= args.swarm_size <= 32:
-        parser.error("--swarm-size must be between 1 and 32 (OMP runs at most 32 concurrent subagents)")
+        parser.error("--swarm-size must be between 1 and 32")
     if args.skip_gap_analysis and not args.gap_report.exists():
         parser.error(f"--skip-gap-analysis requires an existing gap report at {args.gap_report}")
 
@@ -468,7 +472,16 @@ def main() -> None:
             suggestions_written=0,
         )
 
-    runner = OMPSwarmRunner(args.log_dir, timeout_seconds=args.swarm_timeout_seconds)
+    if args.runtime == "mistral":
+        runner = MistralSwarmRunner(
+            args.log_dir,
+            batch_timeout_seconds=args.swarm_timeout_seconds,
+            model=args.mistral_model,
+        )
+        log(f"Mistral runtime: model={runner.model}, concurrency={runner.concurrency}, "
+            f"per-journal timeout={runner.per_journal_timeout:.0f}s")
+    else:
+        runner = OMPSwarmRunner(args.log_dir, timeout_seconds=args.swarm_timeout_seconds)
     written_suggestions = 0
     processed_count = 0
     batch_number = 0
@@ -492,20 +505,24 @@ def main() -> None:
         session_id = f"swarm-{batch_id}"
 
         mission_dir = write_mission(batch_id, batch)
-        log(f"Batch {batch_number}: dispatching {len(batch)} journal(s) to the OMP swarm -> logs/{session_id}.*")
-        run_result = runner.run(session_id=session_id, prompt=build_orchestrator_prompt(mission_dir))
+        log(f"Batch {batch_number}: dispatching {len(batch)} journal(s) "
+            f"({args.runtime} runtime) -> logs/{session_id}.*")
+        if args.runtime == "mistral":
+            run_result = runner.run(session_id=session_id, mission_dir=mission_dir, journals=batch)
+        else:
+            run_result = runner.run(session_id=session_id, prompt=build_orchestrator_prompt(mission_dir))
         if run_result.timed_out:
-            log(f"WARNING: swarm run timed out; collecting whatever result files exist.")
-        log(f"Orchestrator reply: {run_result.final_message.strip() or '(no final message)'}")
+            log("WARNING: swarm run timed out; collecting whatever result files exist.")
+        log(f"Runtime reply: {run_result.final_message.strip() or '(no final message)'}")
 
         batch_rows_total = 0
         for index, journal_gap in enumerate(batch):
             journal_name = journal_gap["name"]
             processed_count += 1
             result_file = mission_dir / "results" / f"{index:02d}-{slugify(journal_name)}.json"
-            payload = parse_result_file(result_file) if result_file.exists() else None
+            result = parse_result_file(result_file) if result_file.exists() else None
 
-            if payload is None:
+            if result is None:
                 # Missing/unparseable result: leave the journal out of the state so
                 # the end-of-run sweep (or a later run) can still harvest a late file.
                 log(f"  {journal_name}: no result file yet — pending late-result sweep")
@@ -515,7 +532,7 @@ def main() -> None:
             status, rows, notes = sanitize_agent_result(
                     journal_name=journal_name,
                     journal_gap=journal_gap,
-                    agent_result=payload,
+                    agent_result=result,
                     existing_keys=existing_keys,
                 )
 
@@ -545,15 +562,15 @@ def main() -> None:
     if pending_collections:
         log(f"Sweeping {len(pending_collections)} pending journal result(s) — subagents may have finished late ...")
         for session_id, journal_gap, result_file in pending_collections:
-            payload = parse_result_file(result_file)
-            if payload is None:
+            result = parse_result_file(result_file)
+            if result is None:
                 log(f"  {journal_gap['name']}: still no result file — left for the next run")
                 continue
             journal_name = journal_gap["name"]
             status, rows, notes = sanitize_agent_result(
                 journal_name=journal_name,
                 journal_gap=journal_gap,
-                agent_result=payload,
+                agent_result=result,
                 existing_keys=existing_keys,
             )
             append_suggestions(args.output, rows)

@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from agent_result import AgentResult
 from enrichment_common import (
     ALLOWED_BUSINESS_MODELS,
     ALLOWED_FIELDS,
@@ -151,14 +152,6 @@ def write_checkpoint(csv_path: Path, checkpoint_path: Path) -> None:
     checkpoint_path.write_text(csv_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
-def coerce_source_urls(raw_value: Any) -> list[str]:
-    if isinstance(raw_value, list):
-        return [str(url).strip() for url in raw_value if str(url).strip()]
-    if isinstance(raw_value, str) and raw_value.strip():
-        return [part.strip() for part in raw_value.split("|") if part.strip()]
-    return []
-
-
 def normalize_name(value: str) -> str:
     return norm_name(value)
 
@@ -175,13 +168,20 @@ def names_equivalent_or_contained(left: str, right: str) -> bool:
     )
 
 
-def sanitize_agent_result(journal_name: str, journal_gap: dict[str, Any], agent_result: dict[str, Any] | None,
+def sanitize_agent_result(journal_name: str, journal_gap: dict[str, Any], agent_result: AgentResult | None,
                           existing_keys: set[tuple[str, str, str]]) -> tuple[str, list[dict[str, str]], str]:
-    if not agent_result:
+    """Validate a parsed per-journal result against the journal's gap request.
+
+    ``agent_result`` is the Pydantic-validated output of either runtime
+    (AgentResult). Rich per-field business rules (evidence wording, ISSN format,
+    alt_name strictness, dedup keys) are applied here, on top of the structural
+    guarantees the model already provides.
+    """
+    if agent_result is None or not agent_result.journal:
         return "error", [], "No JSON object could be parsed from the agent response."
 
-    status = str(agent_result.get("status", "unresolved")).strip().lower()
-    notes = str(agent_result.get("notes", "")).replace("\n", " ").strip()
+    status = agent_result.status.strip().lower()
+    notes = agent_result.notes.replace("\n", " ").strip()
     gap_lookup = {gap["field"]: gap for gap in journal_gap["gaps"]}
     allowed_fields = set(gap_lookup)
     current_publisher = str(journal_gap.get("current_publisher", "")).strip()
@@ -191,21 +191,18 @@ def sanitize_agent_result(journal_name: str, journal_gap: dict[str, Any], agent_
     candidate_rows: list[dict[str, str]] = []
     local_keys = set(existing_keys)
 
-    for item in agent_result.get("suggestions", []):
-        field = str(item.get("field", "")).strip()
-        suggested_value = str(item.get("suggested_value", "")).strip()
+    for item in agent_result.suggestions:
+        field = item.field.strip()
+        suggested_value = item.suggested_value.strip()
         if field not in ALLOWED_FIELDS or field not in allowed_fields or not suggested_value:
             continue
 
-        try:
-            confidence = float(item.get("confidence", 0))
-        except (TypeError, ValueError):
-            continue
+        confidence = item.confidence
         if not 0.55 <= confidence <= 1:
             continue
 
-        suggestion_type = str(item.get("suggestion_type", "")).strip()
-        priority = str(item.get("priority", "")).strip()
+        suggestion_type = item.suggestion_type.strip()
+        priority = item.priority.strip()
         if suggestion_type not in ALLOWED_SUGGESTION_TYPES or priority not in ALLOWED_PRIORITIES:
             continue
 
@@ -217,15 +214,15 @@ def sanitize_agent_result(journal_name: str, journal_gap: dict[str, Any], agent_
                 continue
             suggested_value = digits
 
-        source_urls = coerce_source_urls(item.get("source_urls", []))
+        source_urls = item.source_urls
         if not source_urls:
             continue
 
-        reasoning = str(item.get("reasoning", "")).replace("\n", " ").strip()
+        reasoning = item.reasoning.replace("\n", " ").strip()
         if not reasoning:
             continue
 
-        current_value = str(item.get("current_value", "")).replace("\n", " ").strip()
+        current_value = item.current_value.replace("\n", " ").strip()
         if not current_value:
             current_value = str(gap_lookup[field].get("current_value", "")).replace("\n", " ").strip()
 

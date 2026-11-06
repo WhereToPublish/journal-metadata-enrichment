@@ -23,15 +23,34 @@ echo
 mkdir -p "$LOG_DIR" "$OUTPUT_DIR/state"
 : > "$RUNNER_LOG"
 
+# --- Resolve the agent runtime (env first, then a --runtime flag overrides) ---
+RUNTIME="${JOURNALMIND_RUNTIME:-omp}"
+for ((i = 1; i <= $#; i++)); do
+  if [[ "${!i}" == "--runtime" ]]; then
+    j=$((i + 1))
+    if [[ $j -le $# ]]; then
+      RUNTIME="${!j}"
+    fi
+  fi
+done
+
 # --- Preflight checks -------------------------------------------------------
-command -v omp >/dev/null 2>&1 || fail "'omp' (oh-my-pi) not found in PATH. Install oh-my-pi first: https://github.com/oh-my-pi/oh-my-pi"
 [[ -x "$VENV_PYTHON" ]] || fail "Python virtualenv not found at $VENV_PYTHON"
 "$VENV_PYTHON" -c "import polars" >/dev/null 2>&1 || fail "'$VENV_PYTHON' cannot import polars. Run: $VENV_PYTHON -m pip install -r requirements.txt"
 [[ "$SWARM_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || fail "JOURNALMIND_SWARM_TIMEOUT_SECONDS must be a positive integer (got '$SWARM_TIMEOUT_SECONDS')."
 
+if [[ "$RUNTIME" == "mistral" ]]; then
+  [[ -n "${MISTRAL_API_KEY:-}" ]] || fail "MISTRAL_API_KEY is not set. Create a key in the Mistral Studio console (API keys) and export it."
+  "$VENV_PYTHON" -c "from mistralai import agents" >/dev/null 2>&1 || fail "'$VENV_PYTHON' cannot import the Mistral Agents SDK. Run: $VENV_PYTHON -m pip install -r requirements.txt"
+  RUNTIME_DESCRIPTION="Mistral Agents SDK runtime (model: ${JOURNALMIND_MISTRAL_MODEL:-ministral-3b-latest})"
+else
+  command -v omp >/dev/null 2>&1 || fail "'omp' (oh-my-pi) not found in PATH. Install oh-my-pi first: https://github.com/oh-my-pi/oh-my-pi"
+  RUNTIME_DESCRIPTION="omp (oh-my-pi) swarm orchestrator${JOURNALMIND_MODEL:+ with model override '$JOURNALMIND_MODEL'}"
+fi
+
 # --- Run --------------------------------------------------------------------
-echo "Agent      : omp (oh-my-pi) swarm orchestrator${JOURNALMIND_MODEL:+ with model override '$JOURNALMIND_MODEL'}"
-echo "Timeout    : default ${SWARM_TIMEOUT_SECONDS}s per swarm batch (override per run with --swarm-timeout-seconds)"
+echo "Agent      : $RUNTIME_DESCRIPTION"
+echo "Timeout    : ${SWARM_TIMEOUT_SECONDS}s per batch (override per run with --swarm-timeout-seconds)"
 echo "Runner log : $RUNNER_LOG"
 echo "Python     : $VENV_PYTHON"
 echo

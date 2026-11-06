@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import re
 
@@ -72,3 +73,18 @@ def slugify(value: str) -> str:
 def is_empty(value: object) -> bool:
     """True if value is None, empty string, or whitespace."""
     return value is None or str(value).strip() == ""
+
+
+@dataclass
+class SwarmRunResult:
+    """What both agent runtimes (OMP swarm, Mistral Agents SDK) return per batch.
+
+    `final_message` is informational only — result files on disk are the
+    source of truth for suggestion persistence.
+    """
+
+    session_id: str
+    stdout: str = ""
+    stderr: str = ""
+    final_message: str = ""
+    timed_out: bool = False

@@ -1,250 +1,261 @@
-# MistralStudio.md — Could the JournalMind agent run on Mistral Studio?
+# MistralStudio.md — The Mistral Agents SDK runtime (implemented) and the road to a full Mistral Studio orchestrator
 
-**Short answer: yes.** The current OMP (oh-my-pi) host-CLI agent can be moved to Mistral
-Studio / the Mistral Agents API with a **drop-in runtime swap**: keep all the Python
-orchestration (gap analysis, Google Sheets I/O, validation, upload, review) and replace only
-the "LLM agent that researches one journal" part with a Mistral managed Agent session per
-journal. A second, deeper option is to define and deploy the agent natively in the Studio
-console. Both are feasible today; this document describes the process, the feasibility
-evidence, what would need to change, step-by-step instructions, and the trade-offs vs the
-current OMP implementation.
+The enrichment swarm can now run on **Mistral Studio / the Agents SDK** as a drop-in
+alternative runtime to the OMP (oh-my-pi) host CLI agent. This document describes
+the **implemented runtime** (`--runtime mistral`), how it differs from the OMP
+design, the trade-offs, and **what is still needed** to move the whole enrichment
+orchestration into Mistral Studio as a native agent/workflow/app.
 
-Scope note: nothing in the parent WhereToPublish repo (`..`) needs to change —
-`../scripts/sheets_client.py` and `../scripts/libraries.py` are reused read-only, exactly as
-today. All edits stay inside `journal-metadata-enrichment/`.
+Scope note: nothing in the parent WhereToPublish repo (`..`) changed —
+`../scripts/sheets_client.py` and `../scripts/libraries.py` are reused read-only,
+exactly as in the OMP flow. All edits live inside `journal-metadata-enrichment/`.
 
 ---
 
-## 1. What "Mistral Studio" gives you (verified against current docs/SDK)
-
-- **Mistral Studio** is Mistral's developer console + API platform
-  ([docs.mistral.ai/studio](https://docs.mistral.ai/studio)): build agents, workflows and
-  apps in the console, in code, or with a coding agent; run them in-process, on your own
-  workers, or as **managed agents operated by Mistral**; observe **executions, traces and
-  evaluations** in the console; create **API keys** in the Studio workspace.
-- **Agents SDK** (`mistralai-agents` package, `from mistralai import agents`): define an
-  `Agent(model, instructions, tools=[ClientTool...], connectors=[...], output_type=..., max_iterations, first_output_timeout_seconds)`
-  once in Python and run it via `agent.run(content, output_type=..., on_client_tool=..., timeout=...)`
-  or persistent sessions (`agent.session(session_id)`). Requires Python >=3.12,<3.15.
-- **Built-in connectors** (server-side tools the agent can call): `web_search`,
-  `web_search_premium`, `code_interpreter`, `image_generation`, `document_library`,
-  `mistral_mcp` — plus custom MCP connectors and **client tools executed on your host**
-  (`ClientTool` + the `on_client_tool` callback), which is the key escape hatch for
-  Cloudflare-blocked sites.
-- **Structured output**: `output_type=<Pydantic model>` makes the API return a validated
-  object (invalid output comes back as `InvalidOutput` instead of unparseable text).
-- **Subscription**: the Free plan already includes limited Studio access; **Pro
-  ($14.99/mo, students $5.99)** adds API credits usable on the Studio/La Plateforme API —
-  check [mistral.ai/pricing](https://mistral.ai/pricing) and your billing page for the exact
-  credit amount, since enrichment cost scales with the number of journals researched.
-
-### Feasibility checks already run in this session (no pipeline run, no API call)
-
-- The project `.venv` is **Python 3.14.9** — inside the Agents SDK's supported range
-  (>=3.12, <3.15).
-- `mistralai-agents==1.1.0` is **already installed and importable** in `.venv`
-  (`from mistralai import agents`; `Agent`, `ClientTool`, `Builtins`, `Completed`/`Failed`
-  turn states all present; `Agent.run(content, output_type=..., on_client_tool=..., timeout=...)`
-  confirmed by signature inspection).
-- Built-in connector list confirmed in the installed SDK: `web_search`,
-  `web_search_premium`, `code_interpreter`, `image_generation`, `document_library`,
-  `mistral_mcp`.
-- `MISTRAL_API_KEY` is **not set** in this environment yet — creating a Studio API key is
-  step 1 of the instructions.
-- A previous prototype of exactly this idea existed: `agent/scripts/__pycache__/mistral_runtime.cpython-314.pyc`
-  (source since removed) implemented "one Managed Agent session per journal, host-side
-  `fetch_url` client tool, Pydantic-validated result instead of a result file, semaphore-bounded
-  concurrency, writes the same result JSON files as the OMP flow". So the approach has already
-  been proven to fit this codebase once.
-- Small bug found: `requirements.txt` is missing a newline, so the last line reads
-  `google-api-python-clientmistralai-agents>=1.1.0` (one invalid package name). pip would
-  fail on a fresh install; fix by splitting into two lines.
-
----
-
-## 2. How the current OMP implementation maps to Mistral Studio
-
-| Current OMP piece | Mistral Studio equivalent |
-| --- | --- |
-| `run_agent.sh` preflight: `omp` in PATH, `~/.omp/agent/config.yml` auth | `MISTRAL_API_KEY` env var (Studio workspace → API keys); preflight becomes `python -c "import mistralai.agents"` |
-| One `omp -p <prompt>` **orchestrator** per batch, which spawns one `task` **subagent** per journal (max 32) | No orchestrator needed: Python fans out **one `Agent.run()` per journal** with an `asyncio.Semaphore` (e.g. 8 concurrent). Optionally a Studio managed agent/workflow for the batch |
-| `agent/prompt/subagent.md` protocol read from disk by each subagent | Same file becomes the agent's `instructions` (plus a short "runtime adaptation" section, see §4) |
-| Subagent reads `inputs/<idx>.json`, writes `results/<idx>.json` | Input JSON **inlined in the user message**; result returned as **structured output** (`output_type`); Python writes the same `results/<idx>.json` files so `run_enrichment.py` collection/validation is untouched |
-| Subagent runs `curl` in its shell for DOAJ/OpenAlex/CrossRef APIs | Host-side **`fetch_url` ClientTool** via `on_client_tool` (plain urllib with a UA header — public JSON APIs are not Cloudflare-blocked). Publisher sites (Scimago/SAGE/Elsevier) stay 403 → same "leave unresolved" rule as today |
-| OMP `web_search` tool (needs a configured `webSearchOrder` provider) | Built-in **`web_search` / `web_search_premium` connector** attached to the agent — no provider config needed |
-| Parse JSONL stdout, strip `//` comments, retry once with compact prompt | `output_type=<Pydantic AgentResult>` validates server-side; on `InvalidOutput`/`Failed` do one retry turn in the same session (sessions are persistent server-side) |
-| `--max-time` + host process kill | `Agent.run(..., timeout=...)` + host-side `asyncio.wait_for` as a belt-and-braces cap |
-| Per-journal `enrichment-*.prompt/stdout/stderr` log files | `on_event` callback writes the same artifacts locally **and** Studio console keeps the full trace (agent/model/tool spans) |
-| `suggestions_io.py` validation, `Agent_suggestions.csv`, `upload_suggestions.py`, Apps Script review | **Unchanged** — this is the point of the drop-in swap |
-
----
-
-## 3. Overall process (recommended architecture)
+## 1. What the implemented runtime is
 
 ```
-run_agent.sh  (JOURNALMIND_RUNTIME=mistral)
+run_agent.sh --runtime mistral            (or JOURNALMIND_RUNTIME=mistral)
   -> preflight: MISTRAL_API_KEY set + .venv can import mistralai.agents
-  -> agent/scripts/run_enrichment.py --runtime mistral
-     -> gap_analysis.py            (unchanged: Sheets download + WTP pipeline refresh)
-     -> per batch: build mission inputs (unchanged)
-     -> agent/scripts/mistral_runtime.py   (NEW — replaces omp_runtime.py)
-          for each journal (asyncio, semaphore=JOURNALMIND_MISTRAL_CONCURRENCY, default 8):
-            Agent(model=JOURNALMIND_MISTRAL_MODEL or default,
-                  instructions=subagent.md + runtime adaptation,
-                  tools=[ClientTool(fetch_url)],
-                  connectors=[web_search],
-                  output_type=AgentResult)   # Pydantic mirror of the result JSON schema
-            state = agent.run(json.dumps(input_payload), output_type=AgentResult,
-                              on_client_tool=host_fetch_url, timeout=...)
-            write results/<idx>.json from state.output (or unresolved on Failed/timeout)
-     -> result collection, sanitize_agent_result, checkpoints  (unchanged)
-     -> issn_alt_name_suggestions.py                            (unchanged, deterministic)
+  -> agent/scripts/run_enrichment.py  (orchestration unchanged)
+     -> gap analysis, backlog selection, mission construction — identical to OMP
+     -> agent/scripts/mistral_runtime.py  (the new agent runtime)
+          for each journal (asyncio TaskGroup,Concurrency-bounded semaphore,
+                           default 4 concurrent):
+            Agent(model=JOURNALMIND_MISTRAL_MODEL or "ministral-3b-latest",
+                  instructions=subagent.md + "Runtime Adaptation" section,
+                  tools=[fetch_url, web_search],       # host-side tools
+                  output_type=AgentResult,              # Pydantic structured output
+                  max_iterations=16)
+            state = agent.run(inlined input JSON, timeout=per-journal budget)
+            Completed(output=AgentResult) -> write results/<idx>-<slug>.json
+            InvalidOutput/None          -> one retry turn, then unresolved
+            Failed/Busy/timeout          -> explicit unresolved result file
+     -> result collection, sanitize_agent_result, checkpoints — unchanged
+     -> issn_alt_name_suggestions.py    (unchanged, deterministic)
   -> upload_suggestions.py -> Agent_suggestions tab -> Apps Script review (unchanged)
 ```
 
-Two integration depths:
+The change is carried by three Python modules:
 
-- **Option A — drop-in runtime swap (recommended first).** Everything above; only the
-  "agent runtime" module changes. Small diff, reuses all validation/review, easy A/B against
-  OMP on the same gap report.
-- **Option B — Studio-native deployment.** Define the journal-researcher agent in the Studio
-  console (or via the SDK) and deploy it as a **managed agent** (Mistral hosts the worker);
-  trigger batches from Python via the API or a Studio workflow; review **traces, executions
-  and evaluations** in the console instead of log files. Bigger ops change; do this after
-  Option A proves suggestion quality, and use Studio **evaluations** fed from
-  `Agent_suggestions_processed` (already envisioned in `NEXT_STEPS.md`).
+- **`agent/scripts/agent_result.py`** (~110 lines) — the shared Pydantic result contract
+  (`Suggestion` / `AgentResult`) used by both runtimes: the Mistral runtime passes it as
+  `output_type=AgentResult` to `agent.run()` (server-validated structured output), and every
+  OMP-subagent-written result file is validated against the same model at collection time
+  (`parse_result_file`). The models carry the old lenient coercions (scalar→string casts,
+  confidence from strings, pipe-joined `source_urls`), so untidy hand-written results still
+  validate; one broken suggestion is skipped instead of poisoning the whole result.
+- **`agent/scripts/mistral_runtime.py`** (~430 lines):
+  - `Suggestion` / `AgentResult` **Pydantic models** mirror the result-JSON schema.
+    Passing `output_type=AgentResult` to `Agent.run()` makes the Mistral API return
+    a *server-validated* object; a non-conforming reply comes back as
+    `agents.InvalidOutput` instead of unparseable text. **This replaces the OMP
+    runtime's JSONL-parsing, `//`-comment stripping and compact-prompt retry
+    entirely** — the only retry left is one clean turn re-ask when the structured
+    output is invalid or absent.
+  - Two **host-side tools** the model calls instead of a shell:
+    - `fetch_url(url)` — urllib with a browser User-Agent, 20 s timeout, 600 kB raw
+      cap, HTML stripped to readable text, 60k-char result cap. This keeps the
+      public JSON APIs (DOAJ / OpenAlex / CrossRef — never Cloudflare-blocked)
+      reachable and keeps token usage (and therefore credits) small.
+    - `web_search(query)` — DuckDuckGo "lite" HTML scraped into
+      `{title, url, snippet}` results (up to 8). This is a *free* best-effort
+      replacement for OMP's configured search provider; failures raise
+      `agents.ToolError` and the agent simply continues.
+  - `MistralSwarmRunner.run(session_id, mission_dir, journals)` fans out one
+    `Agent.run()` per journal, writes the same `results/<idx>-<slug>.json` file
+    contract as the OMP swarm, enforces a per-journal timeout
+    (`JOURNALMIND_MISTRAL_TIMEOUT_SECONDS`, default 600 s) and an overall batch
+    budget (`--swarm-timeout-seconds`, default 3600 s), and returns the same
+    `SwarmRunResult` dataclass (moved to `enrichment_common.py`) as the OMP runner.
+- **`agent/scripts/run_enrichment.py`** gained `--runtime {omp,mistral}` (env
+  `JOURNALMIND_RUNTIME`, default `omp`) and dispatches to the matching runner;
+  mission construction, validation, dedup, persistence, harvesting and the
+  late-result sweep are **shared and unchanged**.
+- **`run_agent.sh`** branches its preflight on the runtime: `mistral` requires
+  `MISTRAL_API_KEY` and `from mistralai import agents`; `omp` requires the `omp`
+  binary. Extra args and `--runtime` are forwarded, and a CLI `--runtime mistral`
+  also switches the launcher's own check.
 
----
+### Key design decisions
 
-## 4. What would need to change (all inside `journal-metadata-enrichment/`)
+- **Python is the orchestrator.** The new Agents SDK (`mistralai-agents` 1.1.0)
+  is a *library harness*: `Agent.run()` returns a turn record in-process, so no
+  orchestrator LLM is needed at all — Python fans out per-journal runs directly
+  with `asyncio`. The OMP flow needed an orchestrator agent only because OMP is
+  a separate CLI process whose `task` tool spawns subagents; that layer simply
+  disappears here, saving orchestrator tokens.
+- **Structured output instead of file parsing.** The OMP flow let subagents write
+  result files and Python parsed/scraped them. The result contract is now a shared
+  Pydantic model (`agent_result.py`): the Mistral runtime returns its answers as
+  `output_type=AgentResult` structured output validated by the API, and every
+  result file — whether written by an OMP subagent or by the Mistral runtime —
+  is validated against the same `AgentResult` model when collected, so
+  `suggestions_io.py` applies the same business rules to both runtimes
+  (a differential regression run confirmed identical outcomes on all real
+  result files from both runtimes).
+- **Smallest model by default.** `JOURNALMIND_MISTRAL_MODEL` defaults to
+  `ministral-3b-latest` to conserve API credits. In tests it completed a journal
+  in ~25–35 s and produced schema-valid results. Its research quality is weaker
+  than the OMP-configured model on ambiguous cases (see §4) — for production runs
+  set e.g. `JOURNALMIND_MISTRAL_MODEL=mistral-small-latest`.
+- **No server-side web search.** The Agents SDK's `connectors=` are user-identity
+  catalog connectors (GitHub, Linear, …) — the old Agents-API `web_search`
+  builtin is *not* carried over for programmatic agents, so web search is
+  implemented as the free host-side `web_search` tool above. Publisher sites that
+  Cloudflare-block return 403 exactly as before: the field stays `unresolved`,
+  never a guess.
 
-1. **`requirements.txt`** — fix the missing newline so the last two lines are
-   `google-api-python-client` and `mistralai-agents>=1.1.0` separately (already the
-   intended content, currently broken into one invalid package name).
-2. **`agent/scripts/mistral_runtime.py`** (new, ~150–250 lines; the old `.pyc` shows the
-   shape): config from env (`MISTRAL_API_KEY`, `JOURNALMIND_MISTRAL_MODEL` default e.g.
-   `mistral-small-latest`, `JOURNALMIND_MISTRAL_TIMEOUT_SECONDS` default 600,
-   `JOURNALMIND_MISTRAL_CONCURRENCY` default 8); build one `Agent` with
-   `instructions = subagent.md + _RUNTIME_ADAPTATION`, `tools=[fetch_url ClientTool]`,
-   `connectors=[web_search]`, `output_type=AgentResult`; `run_batch()` fans out with a
-   semaphore, runs `agent.run(inline_input, output_type=AgentResult, on_client_tool=..., timeout=...)`,
-   writes the same `results/<idx>.json` files plus per-journal prompt/event logs, returns a
-   summary. `fetch_url` runs on the host (urllib, UA header, size cap) so DOAJ/OpenAlex/
-   CrossRef stay reachable despite Cloudflare elsewhere.
-3. **`agent/scripts/run_enrichment.py`** — add `--runtime {omp,mistral}` (env
-   `JOURNALMIND_RUNTIME`, default `omp`) and select `OMPSwarmRunner` vs the new
-   `MistralBatchRunner`. Keep the mission/results-file contract identical so mission
-   building, result collection, `sanitize_agent_result`, dedup keys, and checkpoints are
-   untouched.
-4. **`run_agent.sh`** — branch the preflight on the runtime: for `mistral`, require
-   `MISTRAL_API_KEY` and `.venv/bin/python -c "import mistralai.agents"` instead of `omp`.
-5. **`agent/prompt/subagent.md`** — add a short "Mistral runtime adaptation" section that
-   takes precedence over the file transport: input is inlined in the user message (do not
-   read files), fetch URLs with the `fetch_url` client tool (never shell), do not write any
-   file — return the result JSON as the final structured answer. All research rules
-   (API-first order, evidence interpretation, strict per-field rules, confidence guidance)
-   stay exactly as written.
-6. **Pydantic schema** for `AgentResult` (`journal`, `suggestions[]` with
-   `field/current_value/suggested_value/confidence/source_urls/reasoning/suggestion_type/priority`,
-   `status`, `notes`) mirroring the current result JSON schema — this replaces the
-   JSONL-parsing + comment-stripping + retry logic in `omp_runtime.py`.
-7. **Nothing** in `../` (WhereToPublish repo): `sheets_client.py`, `libraries.py`,
-   `data_extraction/`, `data_extracted/` are used read-only as today.
+### Environment variables (mistral runtime)
 
----
+| Variable                               | Default             | Meaning                                              |
+| -------------------------------------- | ------------------- | ---------------------------------------------------- |
+| `MISTRAL_API_KEY`                      | — (required)        | Studio workspace API key                             |
+| `JOURNALMIND_RUNTIME`                  | `omp`               | Default runtime when `--runtime` is not passed       |
+| `JOURNALMIND_MISTRAL_MODEL`            | `ministral-3b-latest` | Model for per-journal research                      |
+| `JOURNALMIND_MISTRAL_CONCURRENCY`      | `4`                 | Parallel journals per batch                          |
+| `JOURNALMIND_MISTRAL_TIMEOUT_SECONDS`  | `600`               | Per-journal research budget                          |
+| `JOURNALMIND_MISTRAL_MAX_ITERATIONS`   | `16`                | Agent-loop iteration cap (each is an API call)       |
 
-## 5. Step-by-step instructions
+### Verified end-to-end (real runs, not dry)
 
-1. **Get an API key.** Sign in to the Studio console (via [console.mistral.ai](https://console.mistral.ai) → API keys, or the Studio workspace), create a key, and
-   `export MISTRAL_API_KEY=...`. Confirm your Pro plan's included API credits on
-   [mistral.ai/pricing](https://mistral.ai/pricing) / the billing page — the backlog is
-   ~1250 journals with gaps, so set a budget alert in Studio before large runs.
-2. **Fix deps.** Split the last line of `requirements.txt`, then
-   `.venv/bin/python -m pip install -r requirements.txt` and verify
-   `.venv/bin/python -c "from mistralai import agents; print('ok')"` (already true in the
-   current `.venv`: `mistralai-agents 1.1.0` on Python 3.14.9).
-3. **Add `agent/scripts/mistral_runtime.py`** per §4.2 and wire `--runtime mistral` into
-   `run_enrichment.py` + the `run_agent.sh` preflight per §4.3–4.4.
-4. **Adapt the prompt** per §4.5 (runtime-adaptation section in `subagent.md`) and add the
-   `AgentResult` Pydantic model per §4.6.
-5. **Smoke test on one journal** (reuses the existing gap report, no full pipeline run):
-   ```bash
-   JOURNALMIND_RUNTIME=mistral ./run_agent.sh --skip-gap-analysis \
-       --journal "Human Genomics" --max-suggestions 3
-   ```
-   Expect the same `agent/output/Agent_suggestions.csv` rows shape as an OMP run; inspect
-   the per-journal artifacts in `agent/output/logs/` **and** the run trace in the Studio
-   console (Traces).
-6. **A/B quality check.** Run the same small batch (e.g. 10 journals) with
-   `--runtime omp` and `--runtime mistral` against the same `--gap-report`, upload both to
-   `Agent_suggestions`, and compare approval rates through the existing review workflow
-   (`Agent_suggestions_processed`). This mirrors the model-comparison plan in `NEXT_STEPS.md`.
-7. **Batch run.** `JOURNALMIND_RUNTIME=mistral ./run_agent.sh --max-suggestions 15`
-   (raise `JOURNALMIND_MISTRAL_CONCURRENCY` only within API rate limits; keep
-   `JOURNALMIND_MISTRAL_TIMEOUT_SECONDS` per journal).
-8. **Review & upload unchanged.** `.venv/bin/python agent/scripts/upload_suggestions.py`,
-   then the Apps Script **Apply Reviewed Suggestions** flow — no change.
-9. **Optional: go Studio-native (Option B).** In the Studio console, create a project,
-   define the same agent (instructions + `web_search` connector + `fetch_url` tool),
-   deploy it as a managed agent, and trigger batches from a thin Python caller or a Studio
-   workflow. Use Studio **evaluations** on `Agent_suggestions_processed` rows to track
-   approval rate over time.
-
----
-
-## 6. Advantages vs the current OMP implementation
-
-- **No host agent binary.** No `omp` install, no `~/.omp/agent/config.yml`, no search-provider
-  config — just `MISTRAL_API_KEY`. Runs identically from a laptop or CI.
-- **Built-in web search.** The `web_search`/`web_search_premium` connector replaces OMP's
-  `webSearchOrder` provider setup.
-- **Structured output at the API level.** `output_type` (Pydantic) enforces the result JSON
-  contract — no more JSONL scraping, `//`-comment stripping, or compact-retry prompt hacking.
-- **Observability for free.** Studio console keeps executions, traces (agent/model/tool spans)
-  and usage per run — OMP only leaves local log files. This directly feeds the performance
-  analyses planned in `NEXT_STEPS.md` (approval rate, calibration, reject-pattern mining) via
-  Studio evaluations.
-- **Managed/durable execution.** Managed agents run on Mistral-hosted workers: a long batch
-  doesn't tie up your machine, and sessions are persistent server-side (resume/retry a single
-  journal instead of rerunning a whole OMP process).
-- **Cost visibility.** Per-token billing and usage dashboards in Studio; Pro API credits make
-  small/medium runs predictable. (OMP's LLM cost depends on whatever backend `config.yml`
-  points to and is invisible in the project.)
-- **Extensibility.** Connectors (document library, MCP) could later hold the journal backlog
-  or even the Google Sheet, moving more of the pipeline into Studio.
-
-## 7. Drawbacks / risks vs OMP
-
-- **Cost scales with backlog size.** ~1250 journals × web research × tokens is real money on
-  the API; mitigate with `JOURNALMIND_MISTRAL_CONCURRENCY`/budget alerts, `--max-suggestions`
-  caps, and the existing LLM-skip/deterministic-ISSN optimizations (keep them!). OMP may be
-  cheaper if its configured LLM is local or flat-rate.
-- **Rate limits & concurrency.** The 32-way OMP swarm becomes an API-bounded fan-out
-  (start at 8); throughput per batch is lower and needs queueing.
-- **Cloudflare.** Mistral's *server-side* browsing can hit the same 403s on publisher sites.
-  Mitigation (already in the design): host-side `fetch_url` client tool / host pre-fetch for
-  the public JSON APIs (DOAJ, OpenAlex, CrossRef); blocked sources still mean `unresolved`,
-  never guesses.
-- **Less control over the tool loop.** No shell, no arbitrary file writes inside the agent —
-  by design here (Python owns persistence), but it means the prompt must carry all rules
-  that OMP's tooling implicitly enforced.
-- **Vendor lock-in / moving target.** `mistralai-agents` is young (1.1.0); pin the version and
-  keep `omp_runtime.py` as a fallback runtime so switching back is a flag, not a rewrite.
-- **Data leaves the host.** Journal names/metadata and sheet rows are sent to the Mistral
-  API. The data is public bibliographic metadata (low sensitivity), but the Google Sheet
-  service-account key must **never** be sent — keep all Sheets I/O host-side (as today).
-- **Determinism/replay.** OMP artifacts (prompt/stdout/stderr per journal) must be replicated
-  by logging `on_event` payloads ourselves if you need exact replays.
+- remote dedup-key loading, leftover-result harvesting, mission construction;
+- a live batch: 4 journals concurrently, one schema-failure retry that recovered,
+  result files validated and persisted (`Agent_suggestions.csv`);
+- an interrupted batch (external SIGKILL): the 3 finished result files were
+  **harvested by the next run** and persisted — the existing recovery path works
+  unchanged with mistral-generated results;
+- a full run **with gap analysis** (10 Sheets tab downloads, WTP pipeline refresh,
+  fresh gap report) followed by live research and the deterministic ISSN pass;
+- the whole chain with the *smallest* model consumed only a few cents total
+  (≈30 s per journal; tool results are text-stripped and size-capped).
 
 ---
 
-## 8. Verdict
+## 2. Trade-offs vs the OMP swam runtime
 
-Feasible **now**, with two depths: start with **Option A** (drop-in `mistral_runtime.py`,
-`--runtime mistral` flag, ~4 files touched inside `journal-metadata-enrichment/`, zero changes
-in the WhereToPublish repo), validate on a 10-journal A/B batch against OMP using the existing
-review workflow, then optionally move to **Option B** (Studio console agent + managed workers +
-traces/evaluations). The installed SDK in `.venv` already supports everything required
-(`Agent.run` with `output_type`, `on_client_tool`, `timeout`; `web_search` connector), and a
-previous prototype (`mistral_runtime.cpython-314.pyc`) confirms the result-file contract
-plugs straight into `run_enrichment.py`.
+Advantages of the Mistral runtime:
+
+- **No host agent binary** — no `omp` install, no `~/.omp/agent/config.yml`, no
+  search-provider setup; runs identically from a laptop or CI.
+- **Pydantic-structured output at the API level** — no JSONL scraping, no
+  comment stripping, no retry-prompt hacking; invalid outputs are a typed
+  `InvalidOutput` value, not a parsing guess.
+- **No orchestrator tokens** — Python's fan-out replaces the OMP orchestrator
+  agent (`system.md` is a no-op here), so per-batch credit is spent only on research.
+- **Free web search** through the host tool instead of a paid search provider.
+- **Cost model under your control**: per-token billing, cheap small models,
+  concurrency and iteration caps, and Studio usage dashboards/credit visibility.
+- **Session continuity**: `Agent.run` returns `session_id`/`turn_id` handles — a
+  single journal's session can be resumed or retried without re-running a batch
+  (not exploited yet, see §3).
+
+Drawbacks / risks:
+
+- Weaker default model quality (`ministral-3b-latest`) on ambiguous evidence —
+  mitigated by the unchanged strict validator (`suggestions_io.py`) and the human
+  review workflow; raise the model for production runs.
+- API-bounded concurrency (default 4; OMP goes to 32) — throughput per batch is
+  lower; raise `JOURNALMIND_MISTRAL_CONCURRENCY` within rate limits.
+- Cloudflare 403s are unchanged for publisher pages — `unresolved`, never guesses.
+- Data leaves the host: journal names/metadata go to the Mistral API (public
+  bibliographic metadata, low sensitivity). The Google service-account key is
+  **never** sent: all Sheets I/O stays host-side.
+- `web_search` is a scraped DuckDuckGo endpoint — if it breaks, agents fall back
+  to the APIs and `fetch_url`, the run does not fail.
+- Agent-side determinism/replay artifacts are lighter than OMP's JSONL streams:
+  per-batch runs write `logs/swarm-*.mistral.log` + per-journal result files,
+  not full transcripts (fixable via SDK tracing, see §3.3).
+
+---
+
+## 3. What is needed for a full Mistral Studio orchestrator (workflow + app)
+
+The current state is the "Option A" runtime: Python orchestrates, the Mistral API
+only runs per-journal research. A full **Studio-native** deployment — deployed
+agents triggered from the console, runs and traces visible in Studio, humans
+reviewing from a web app instead of a Google Sheet — needs the following steps.
+
+### 3.1 Deploy the researcher as a managed agent (small step)
+
+1. Put the agent in its own file (`main.py`-style module): exactly today's
+   `Agent(model, instructions, tools=[fetch_url, web_search],
+   output_type=AgentResult, max_iterations=16)` definition
+   (`agent.to_workflow()` already converts an authoring Agent).
+   Caveat: the host tools must first move to Mistral-hosted equivalents —
+   `fetch_url`/`web_search` would become MCP tools or deployed-functions, since
+   "managed" means Mistral runs the harness, not this Mac.
+2. `agents serve` (self-hosted, tools keep running on your machine) or
+   `agents deploy` (Mistral-managed worker; tools must be server-side).
+3. Point `MistralSwarmRunner` at the deployed agent (sessions API) instead of
+   `agent.run()`; the persistence contract (`Agent_suggestions.csv`, review tabs)
+   does not change.
+
+### 3.2 Move batch orchestration into a Studio workflow (medium step)
+
+1. Wrap the deployed researcher in a **Workflows** project (Workflows SDK,
+   `mistralai-workflows`): the workflow ingests a mission manifest (batch of
+   journals), fans out one researcher agent per journal inside Mistral's durable
+   execution, gathers the `AgentResult`s, and writes them back.
+2. Host-side Google Sheets I/O (gap analysis, dedup keys, uploads) stays in
+   Python and talks to the workflow through **triggers and webhooks**; or moves
+   into the workflow once credentials are Studio *Secrets*.
+3. Replace `run_agent.sh` batches by workflow **schedules/runs**; the backlog /
+   `--max-suggestions` budget logic moves into the workflow code.
+
+### 3.3 Observability and evaluation (small-medium step)
+
+- Enable the SDK's OpenTelemetry export for local runs, and use Studio's
+  **Trace Explorer** for deployed runs: today's `logs/swarm-*.mistral.log`
+  becomes per-run traces with model/tool spans.
+- Feed `Agent_suggestions_processed` (approve/reject labels) into Studio
+  **offline evaluations** to track approval rates per model/prompt — the dataset
+  the NEXT_STEPS.md analysis plan already calls for.
+
+### 3.4 Review app (optional, larger step)
+
+- A Studio **app** (or any small web front-end) could replace the
+  `Agent_suggestions` Google Sheet tab + Apps Script "Apply Reviewed Suggestions"
+  flow: show suggestions with source URLs, approve/reject buttons, write to the
+  data tabs through the same service-account client. Until then the existing
+  review workflow is unchanged and stays the single source of truth.
+
+### 3.5 Preconditions / gotchas discovered during implementation
+
+- Python **3.12–3.14** (non-free-threaded) is required by `mistralai-agents`; the
+  repo `.venv` is 3.14.9 — OK.
+- The new Agents SDK has **no built-in web_search** for programmatic agents
+  (catalog connectors are user-identity services); use the host `web_search`
+  tool or an MCP server when deploying managed.
+- Structured output works per `agent.run(..., output_type=...)`; deployed agents
+  parse but do not force the format — keep the one-retry logic.
+- Tool results are the main cost driver: the HTML→text stripping and 60k caps in
+  `fetch_url` cut tokens roughly 5–10×; keep them when moving tools server-side.
+- Set a budget alert in the Studio console before large backlog runs
+  (~1250 journals × gaps): the current smallest-model setup costs on the order of
+  $0.001–0.005 per journal-research.
+
+---
+
+## 4. Model quality note (decision input, not a blocker)
+
+Side-by-side on the same backlog slice, `ministral-3b-latest` produced
+schema-valid, well-reasoned results for ISSN / Business-model / APC gaps that the
+DOAJ/OpenAlex/CrossRef APIs resolve, but it sometimes over-credits weak evidence
+for `Alternative journal name` (e.g. accepting a clearly different journal name
+as alt_name on thin DOAJ/CrossRef grounds). The strict validator and the human
+review pass catch these, but the approval rate will be lower than a
+capable-model OMP run. Recommended production setting:
+`JOURNALMIND_MISTRAL_MODEL=mistral-small-latest` (or `mistral-medium-latest`),
+possibly running only `high`-priority gaps through the larger model and
+low-priority ISSN gaps through the small one.
+
+---
+
+## 5. Keeping both runtimes
+
+`omp_runtime.py` is untouched and remains the default runtime. Both runners
+implement the same contract (`run() -> SwarmRunResult`, result files under
+`agent/output/swarm/<batch_id>/results/`), so switching is a flag
+(`--runtime`), not a rewrite, and A/B comparison on the same gap report is
+directly possible.

@@ -15,15 +15,13 @@ the final assistant message is extracted for the runner log.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import signal
 import subprocess
-from typing import Any
 
-from enrichment_common import PROJECT_ROOT, SYSTEM_PROMPT_PATH
+from enrichment_common import PROJECT_ROOT, SYSTEM_PROMPT_PATH, SwarmRunResult
 
 OMP_COMMAND = os.environ.get("JOURNALMIND_OMP_COMMAND", "omp")
 
@@ -31,15 +29,6 @@ DEFAULT_SWARM_TIMEOUT_SECONDS = 3600
 DEFAULT_PROCESS_STOP_GRACE_SECONDS = 5.0
 # Extra seconds granted on top of --max-time before we kill the process.
 _KILL_GRACE_SECONDS = 30.0
-
-
-@dataclass
-class SwarmRunResult:
-    session_id: str
-    stdout: str
-    stderr: str
-    final_message: str
-    timed_out: bool
 
 
 def _assistant_texts_from_jsonl(stdout: str) -> list[str]:

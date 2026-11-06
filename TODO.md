@@ -8,10 +8,8 @@ Read them in depth to understand the project, the dependencirs, what is done and
 
 In this session, we will work on the following task:
 
-- Implement this kind of AI agent into Mistral Studio (I have a pro subscription). MistralStudio.md file gives the overall process, feasibility and how would that work, what would need to change, the step-by-step instruction, and the advantage/drawback compared to the current OMP implementation. Implement this while being careful with small test first.
-- Use Pydantic instead of JSONL-parsing + comment-stripping + retry logic in runtime.
-- Once it words, update the MistralStudio.md to explain how the implementation, and what will be necessary to do next to have a full Mistral Studio orchestrator running from there.
-- The API_KEY is already set.
+- Implement a MistralStudio workflow, but not the app. MistralStudio.md file gives the overall process, feasibility and how would that work, what would need to change, the step-by-step instruction, use this as blueprint but be thorough, there might be improvement possible based on this blueprint, read the Mistral Studio documentation. Implement this while being careful with small test first, use the smallest mistral model to not run of studio API credit, I have only a few $ of credits left, so be parsimonious during implementation.
+- I want to run the workflow from MistralStudio website, it should pull the google sheet and run the process scripts and then the AI enrichment, it should never modify another tab than AI suggestions. I have a separate config (.json).
 
 Always run the pipeline, the AI agent and the code (not in dry-rn) to check that it is working. Don't finish until it is working as intended.
 
