@@ -1,9 +1,20 @@
+"""issn_alt_name_suggestions.py — deterministic Alternative journal name generator.
+
+Builds ISSN → journal-title lookups from the WhereToPublish external data files
+(Scimago, DOAJ, OpenAPC) in <wtp_dir>/data_extraction/ and resolves
+Alternative journal name values for journals whose name is empty but that
+already have at least one ISSN.  No LLM is involved.
+
+Run from the journal-metadata-enrichment/ project root:
+    python3 agent/scripts/issn_alt_name_suggestions.py
+"""
+
 from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -14,12 +25,6 @@ if str(WTP_SCRIPTS_DIR) not in sys.path:
 
 import sheets_client
 from libraries import format_issn, norm_name
-from issn_lookups import (
-    load_doaj_issn_title_lookup,
-    load_openapc_issn_title_lookup,
-    load_scimago_issn_title_lookup,
-)
-
 from suggestions_io import dedupe_suggestions, load_suggestions, write_suggestions
 
 
@@ -28,11 +33,70 @@ ISSN_FIELDS = ("e-ISSN", "p-ISSN", "ISSN-L")
 PRESENCE_COLUMNS = ("Present in Scimago", "Present in DOAJ", "Present in openAPC")
 
 
-@dataclass(frozen=True)
+# ---------------------------------------------------------------------------
+# ISSN → title lookup builders (stdlib csv/gzip readers only)
+# ---------------------------------------------------------------------------
+
+def _iter_gz_rows(path: Path, delimiter: str = ",") -> Iterator[dict[str, str]]:
+    with gzip.open(path, "rt", encoding="utf-8", errors="replace", newline="") as handle:
+        yield from csv.DictReader(handle, delimiter=delimiter)
+
+
+def _add_issn(lookup: dict[str, list[str]], raw_issn: str, title: str) -> None:
+    formatted = format_issn(raw_issn)
+    if formatted is None or not title:
+        return
+    lookup.setdefault(formatted, [])
+    if title not in lookup[formatted]:
+        lookup[formatted].append(title)
+
+
+def load_scimago_issn_title_lookup(wtp_dir: Path) -> dict[str, list[str]]:
+    """Scimago: the 'Issn' column holds a comma-separated list of bare ISSNs."""
+    path = wtp_dir / "data_extraction" / "scimagojr.csv.gz"
+    lookup: dict[str, list[str]] = {}
+    for row in _iter_gz_rows(path, delimiter=";"):
+        title = (row.get("Title") or "").strip()
+        for raw in (row.get("Issn") or "").split(","):
+            _add_issn(lookup, raw.strip(), title)
+    return lookup
+
+
+def load_doaj_issn_title_lookup(wtp_dir: Path) -> dict[str, list[str]]:
+    """DOAJ: print ISSN and EISSN are separate columns."""
+    path = wtp_dir / "data_extraction" / "DOAJ.csv.gz"
+    lookup: dict[str, list[str]] = {}
+    for row in _iter_gz_rows(path):
+        title = (row.get("Journal title") or "").strip()
+        _add_issn(lookup, row.get("Journal ISSN (print version)") or "", title)
+        _add_issn(lookup, row.get("Journal EISSN (online version)") or "", title)
+    return lookup
+
+
+def load_openapc_issn_title_lookup(wtp_dir: Path) -> dict[str, list[str]]:
+    """OpenAPC: issn, issn_print, issn_electronic and issn_l columns."""
+    path = wtp_dir / "data_extraction" / "openapc.csv.gz"
+    lookup: dict[str, list[str]] = {}
+    for row in _iter_gz_rows(path):
+        title = (row.get("journal_full_title") or "").strip()
+        for column in ("issn", "issn_print", "issn_electronic", "issn_l"):
+            raw = (row.get(column) or "").strip()
+            if raw.upper() == "NA":
+                continue
+            _add_issn(lookup, raw, title)
+    return lookup
+
+
+# ---------------------------------------------------------------------------
+# Deterministic suggestion generation
+# ---------------------------------------------------------------------------
+
 class SourceConfig:
-    name: str
-    loader: Callable[[Path], dict[str, list[str]]]
-    url_builder: Callable[[str], str]
+    def __init__(self, name: str, loader: Callable[[Path], dict[str, list[str]]],
+                 url_builder: Callable[[str], str]) -> None:
+        self.name = name
+        self.loader = loader
+        self.url_builder = url_builder
 
 
 SOURCE_PRIORITY = (
@@ -89,10 +153,6 @@ def needs_alt_name_suggestion(row: dict[str, str]) -> bool:
     return any(str(row.get(column, "")).strip() == "No" for column in PRESENCE_COLUMNS)
 
 
-def load_source_lookups(wtp_dir: Path) -> list[tuple[SourceConfig, dict[str, list[str]]]]:
-    return [(source, source.loader(wtp_dir)) for source in SOURCE_PRIORITY]
-
-
 def resolve_source_match(
     lookup: dict[str, list[str]], issns: list[str]
 ) -> tuple[str, str] | None:
@@ -137,7 +197,7 @@ def build_suggestion(
 
 
 def generate_suggestions(wtp_dir: Path) -> tuple[list[dict[str, str]], int]:
-    lookups = load_source_lookups(wtp_dir)
+    lookups = [(source, source.loader(wtp_dir)) for source in SOURCE_PRIORITY]
     candidate_count = 0
     suggestions: list[dict[str, str]] = []
 
@@ -169,6 +229,18 @@ def generate_suggestions(wtp_dir: Path) -> tuple[list[dict[str, str]], int]:
                 break
 
     return suggestions, candidate_count
+
+
+def append_deterministic_suggestions(output: Path, wtp_dir: Path) -> int:
+    """Generate deterministic alt-name rows and merge them into the CSV.
+
+    Returns the number of suggestions written.
+    """
+    existing_rows = load_suggestions(output)
+    generated_rows, _ = generate_suggestions(wtp_dir)
+    deduped_rows, _ = dedupe_suggestions(existing_rows + generated_rows)
+    write_suggestions(output, deduped_rows)
+    return len(generated_rows)
 
 
 def main() -> None:

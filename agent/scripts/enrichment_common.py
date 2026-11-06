@@ -16,13 +16,20 @@ STATE_DIR = OUTPUT_DIR / "state"
 DEFAULT_WTP_DIR = PROJECT_ROOT.parent
 WTP_SCRIPTS_DIR = DEFAULT_WTP_DIR / "scripts"
 
-# System prompt handed to the OMP agent for every per-journal run.
+# OMP prompt files. system.md is appended to the orchestrator run's system prompt;
+# each swarm subagent reads subagent.md from disk at runtime.
 SYSTEM_PROMPT_PATH = AGENT_DIR / "prompt" / "system.md"
+SUBAGENT_PROTOCOL_PATH = AGENT_DIR / "prompt" / "subagent.md"
 
 GAP_REPORT_PATH = OUTPUT_DIR / "gap_report.json"
 SUGGESTIONS_CSV_PATH = OUTPUT_DIR / "Agent_suggestions.csv"
 RUN_STATE_PATH = STATE_DIR / "run_state.json"
 GAP_ANALYSIS_SCRIPT = SCRIPT_DIR / "gap_analysis.py"
+SWARM_DIR = OUTPUT_DIR / "swarm"
+
+# Gap fields the LLM has never resolved in practice — journals with only these
+# gaps are never sent to the swarm.
+UNRESOLVABLE_FIELDS = {"Institution", "Institution type"}
 
 CSV_HEADERS = [
     "journal",
