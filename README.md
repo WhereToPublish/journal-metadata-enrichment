@@ -24,25 +24,30 @@ The runtime is built around one swarm of parallel agents per batch of journals.
    - **Mistral**: `agent/scripts/mistral_runtime.py` fans out one `agents.Agent` run per journal (asyncio, concurrency `JOURNALMIND_MISTRAL_CONCURRENCY`). Each agent gets the input JSON inlined in its user message, follows `subagent.md` plus a runtime-adaptation section (no file transport — it has no shell), fetches through the host-side `fetch_url` / `web_search` tools, and returns its result as a **Pydantic-validated structured output** (`output_type=AgentResult`); Python writes the same `results/<idx>-<slug>.json` files. One schema-failure retry per journal; failures and timeouts produce explicit `unresolved` result files.
 5. Python owns persistence: the runner reads every result file and validates it against the shared Pydantic `AgentResult` model (`agent_result.parse_result_file`), then applies the business rules of `suggestions_io.sanitize_agent_result` (requested-fields-only, format, evidence and confidence rules), deduplicates against the local CSV and the remote sheet keys, and appends accepted rows to `agent/output/Agent_suggestions.csv`, canonicalized on `(journal, field)` so only the highest-confidence row is kept. Result files that were not written before the batch timeout are swept once at the end of the run (OMP's worker daemon keeps finishing in-flight subagents in the background); journals that still produced nothing stay unprocessed and are retried by a later run.
 6. After the AI pass, the runner generates deterministic `Alternative journal name` suggestions from the enriched WhereToPublish CSVs (`agent/scripts/issn_alt_name_suggestions.py`): journals with an empty `Alternative journal name`, at least one ISSN, and a missing-source presence flag are matched by ISSN with source priority **Scimago → DOAJ → OpenAPC**; matches that are a real name change (not a formatting variant) are written as `confidence = 1.00` rows into the same CSV.
-7. `agent/scripts/upload_suggestions.py` pushes `Agent_suggestions.csv` to the `Agent_suggestions` tab of the WhereToPublish Google Sheet (manual step, run after reviewing the output). Each row gets a **Status** column (pending / approve / reject); new rows are uploaded as `pending`.
+7. `agent/scripts/upload_suggestions.py` pushes `Agent_suggestions.csv` to the `Agent_suggestions` review tab of the WhereToPublish Google Sheet (manual step, run after reviewing the output). It shares the review-tab schema and upload helpers of the deterministic disagreement report (`scripts/review_common.py` of the parent repo): each row gets a **Status** column (pending / approve / reject, new rows `pending`) plus the pre-resolved target cell (`data_tab`, `target_row`, `target_col`) computed from the `data_extracted/` tab CSVs, so the Google Apps Script applies approvals with a single verified cell write instead of scanning whole data tabs.
 
 ## Review Workflow
 
-After upload, team members open the `Agent_suggestions` tab and set each row's **Status** to:
+The AI suggestions and the pipeline's deterministic disagreement report
+(`WhereToPublish/logs/disagreements.csv` → `Disagreements` tab, regenerated on every
+pipeline run) share the same review interface, upload code, and Apps Script (the
+schema lives in `../scripts/review_common.py`, the Apps Script in
+`../apps_script/ApplyReviewedChanges.gs`); they only live on different tabs. After upload, team members open a review tab and set
+each row's **Status** to:
 
 - `approve` — apply the suggestion to the data tab
 - `reject` — discard the suggestion (archived for analysis)
 - `pending` — not yet reviewed (default after upload)
 
-Running **WhereToPublish → Apply Reviewed Suggestions** from the Apps Script menu:
+Running **WhereToPublish → Apply Reviewed Changes** from the Apps Script menu (also processes the `Disagreements` tab):
 
-- `approve` rows: the suggested value is written to the journal's field in the appropriate data tab, then the row is immediately deleted from `Agent_suggestions` and archived in `Agent_suggestions_processed`.
-- `reject` rows: the row is immediately deleted from `Agent_suggestions` and archived in `Agent_suggestions_processed` without any data change.
+- `approve` rows: the script verifies the recorded target cell (`data_tab`/`target_row`/`target_col`: column header, journal of the row, and current cell value — or the already-applied suggested value) and writes `suggested_value` into that single cell; then the row is archived in `<tab>_processed` and deleted from the review tab. Failed verifications (moved rows, changed values, missing targets) leave the row in place and are reported in the summary alert.
+- `reject` rows: the row is archived in `<tab>_processed` and deleted without any data change.
 - `pending` rows are left untouched.
 
-Each row is deleted from `Agent_suggestions` as soon as it is archived, so if the script is interrupted, only unprocessed rows remain and the script can be safely re-run.
+Each processed row is archived and deleted in one batch per run; rows whose verification failed stay in the review tab. If the script is interrupted, it can be safely re-run: already-applied rows pass the idempotency check and everything else re-verifies from scratch.
 
-The `Agent_suggestions_processed` archive contains all reviewed suggestions (approve + reject) and can be used to analyze agent performance over time (see `NEXT_STEPS.md`).
+The `<tab>_processed` archives (`Agent_suggestions_processed`, `Disagreements_processed`) contain all reviewed rows (approve + reject) and can be used to analyze agent performance and disagreement quality over time (see `NEXT_STEPS.md`). Note that the `Disagreements` tab is regenerated from scratch by every pipeline run — statuses set there do not persist across pipeline runs.
 
 ## Architecture
 
@@ -94,10 +99,11 @@ In the OMP runtime, `omp` runs directly on the host with the project root as wor
 - `agent/scripts/agent_result.py`: the shared **Pydantic result contract** — `Suggestion` / `AgentResult` models (with the lenient coercions for untidy hand-written results), `unresolved_result()`, and `parse_result_file()` / `write_result_file()`. The Mistral runtime returns its answers as `output_type=AgentResult` structured output, and every result file (OMP-subagent-written or Mistral-runtime-written) is validated through the same models when collected; a payload without a journal name is invalid, and one broken suggestion never poisons the whole result.
 - `agent/scripts/suggestions_io.py`: per-field validation and persistence — takes the Pydantic-validated `AgentResult` from either runtime, enforces all business rules (evidence wording, ISSN format, alt-name strictness, dedup keys), canonicalizes `Agent_suggestions.csv` on `(journal, field)`, and writes run state and checkpoints.
 - `agent/scripts/issn_alt_name_suggestions.py`: deterministic `Alternative journal name` generator — builds the ISSN → title lookups for Scimago, DOAJ, and OpenAPC directly from `../data_extraction/*.csv.gz` (stdlib csv/gzip) and writes `confidence = 1.00` `alt_name` rows; called automatically at the end of every run and usable standalone.
-- `agent/scripts/upload_suggestions.py`: uploads `Agent_suggestions.csv` to the `Agent_suggestions` tab with a Status column (pending/approve/reject); deduplicates the CSV before upload.
+- `agent/scripts/upload_suggestions.py`: uploads `Agent_suggestions.csv` to the `Agent_suggestions` review tab through the shared `../scripts/review_common.py` (Status column pending/approve/reject, resolved data_tab/target_row/target_col, Status dropdown, report formatting); deduplicates the CSV before upload.
 - `agent/prompt/system.md`: orchestrator system prompt appended to every OMP run (mission, spawn protocol, boundaries, completion report).
 - `agent/prompt/subagent.md`: per-journal research protocol read by every subagent (workflow, API evidence interpretation rules, strict rules, confidence guidance, result JSON schema).
-- `GOOGLE_APP_SCRIPT.md`: Apps Script setup for the human review workflow.
+- `../apps_script/GOOGLE_APP_SCRIPT.md`: Apps Script setup for the human review workflow shared by the `Agent_suggestions` and `Disagreements` tabs.
+- `../apps_script/ApplyReviewedChanges.gs`: the unified Google Apps Script of the parent WhereToPublish repo processing both review tabs; each approval is a verified single-cell write to the recorded target cell (journal, column header, and current value are re-checked, so stale targets fail safely and re-runs are idempotent).
 - `MistralStudio.md`: the Mistral Agents SDK runtime — how the implemented runtime works, trade-offs vs OMP, and the remaining steps to a Studio-native orchestrator (deployed agent, workflow, traces/evaluations, review app).
 - `NEXT_STEPS.md`: roadmap for using the suggestion history to analyze and improve agent performance.
 
@@ -163,7 +169,7 @@ After a run, push `Agent_suggestions.csv` to the spreadsheet for review:
 .venv/bin/python agent/scripts/upload_suggestions.py
 ```
 
-This replaces the content of the `Agent_suggestions` tab with the current suggestions. Before upload, duplicate `(journal, field)` rows are removed and only the highest-confidence row for each suggested column is kept. Each row has a **Status** column (pending / approve / reject) set to `pending` by default. Team members set the status for each row, then run **WhereToPublish → Apply Reviewed Suggestions** from the Apps Script menu.
+This replaces the content of the `Agent_suggestions` tab with the current suggestions. Before upload, duplicate `(journal, field)` rows are removed and only the highest-confidence row for each suggested column is kept. Uploaded rows are sorted for review: high → medium → low priority, then confidence (descending), with all suggestions of a journal kept as a contiguous group ordered by its best suggestion — so journals are reviewed one at a time, best suggestions first. Each row has a **Status** column (pending / approve / reject) set to `pending` by default, plus the resolved `data_tab`/`target_row`/`target_col` of the data cell to change (journals that cannot be resolved — missing or present in several tabs — get empty targets and are handled manually). Team members set the status for each row, then run **WhereToPublish → Apply Reviewed Changes** from the Apps Script menu.
 
 Options:
 

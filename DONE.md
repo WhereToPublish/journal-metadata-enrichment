@@ -75,8 +75,18 @@ run_agent.sh
 
 agent/scripts/upload_suggestions.py  (run manually after enrichment)
   -> agent/scripts/suggestions_io.py — collapses duplicate (journal, field) rows, keeps highest confidence
-  -> ../scripts/sheets_client.py — writes Agent_suggestions tab with Status column
+  -> ../scripts/review_common.py — shared review-tab schema + upload (see below): resolves each
+     journal's target cell (data_tab/target_row/target_col) from ../data_extracted/, prepends the
+     Status column (new rows 'pending'), clears + rewrites the Agent_suggestions tab, applies the
+     report styling and the pending/approve/reject dropdown on the Status column
 ```
+
+Both review workflows of the spreadsheet (AI suggestions here, disagreements of the WTP pipeline)
+share the same schema (../scripts/review_common.py), the same upload helper, and the same Apps
+Script (../apps_script/ApplyReviewedChanges.gs in the parent repo): they only live on different tabs.
+- `Agent_suggestions` tab (AI suggestions, uploaded manually by upload_suggestions.py)
+- `Disagreements` tab (deterministic conflicts, regenerated + uploaded by every WTP pipeline run
+  of ../scripts/update_extracted.py + ../scripts/upload_sheets.py, all rows back to `pending`)
 
 Key runtime properties (common):
 
@@ -138,7 +148,7 @@ Key runtime properties (Mistral only):
 
 - `README.md`: human-facing overview of the current runtime
 - `DONE.md`: this file
-- `GOOGLE_APP_SCRIPT.md`: Apps Script setup for the human review workflow
+- `../apps_script/GOOGLE_APP_SCRIPT.md`: Apps Script setup for the human review workflow (documented in the parent WhereToPublish repo)
 - `NEXT_STEPS.md`: roadmap for using suggestion history to improve the agent
 - `MistralStudio.md`: the Mistral Agents SDK runtime — implemented architecture, trade-offs vs the OMP runtime, and the remaining steps toward a Studio-native orchestrator (deployed agent, workflow, traces/evaluations, review app)
 - `run_agent.sh`: launcher used for real runs (both runtimes)
@@ -269,13 +279,24 @@ Deterministic `Alternative journal name` generator, including the ISSN → title
 
 ### agent/scripts/upload_suggestions.py
 
-Upload script for staging suggestions in the Google Sheet.
+Upload script for staging suggestions in the Google Sheet review tab.
 
 - reads `Agent_suggestions.csv`; removes duplicate `(journal, field)` rows before upload, keeping the highest-confidence row per suggested column
 - rewrites the cleaned CSV back to disk when duplicates were present
-- creates or reuses the `Agent_suggestions` tab, clears its content, and writes a fresh header + data rows
-- prepends a `Status` column; new rows are always uploaded as `pending`
-- options: `--input`, `--credentials`
+- sorts the rows for review before upload: priority (high → medium → low, unknown last), then confidence descending, with all suggestions of a journal kept as one contiguous group (grouped ordered by their best suggestion)
+- resolves each suggestion's target cell (`data_tab`, `target_row`, `target_col`) from `../data_extracted/` through `../scripts/review_common.locate_journal_cell`; journals that are missing or present in several tabs get empty targets (the Apps Script reports them for manual handling)
+- uploads through the shared `review_common.upload_review_tab`: tab created/cleared/rewritten, `Status` column prepended (new rows `pending`), report styling + Status dropdown applied
+- options: `--input`, `--credentials`, `--data-extracted-dir` (target resolution)
+
+### ../apps_script/ApplyReviewedChanges.gs (parent repo)
+
+The unified Google Apps Script of the review workflow (both tabs; see `../apps_script/GOOGLE_APP_SCRIPT.md` in the parent repo).
+
+- menu **WhereToPublish**: `Review Disagreements` / `Review Agent suggestions` (open the review tabs) and `Apply Reviewed Changes` (`applyReviewedSuggestions` kept as a backwards-compatible alias)
+- reads each review tab, processes `approve` / `reject` rows of `Agent_suggestions` and `Disagreements`
+- each approval is a verified single-cell write to the recorded target: the column header at `target_col` must match `field`, the Journal cell of `target_row` must match `journal`, and the cell must hold the recorded `current_value` (or the already-applied `suggested_value` — idempotent re-runs); `suggestion_type: remove` writes `FLAGGED_FOR_REMOVAL` onto the Journal column
+- failed verifications leave the row in the review tab and are reported in the summary alert
+- processed rows are batch-archived in `<tab>_processed` and batch-deleted in descending row order; tab headers are cached per run, so no whole data tab is ever scanned
 
 ### agent/scripts/agent_result.py
 
@@ -334,16 +355,20 @@ shell/file access, `fetch_url` instead of `curl`, the final answer given as the 
 
 ## Review Workflow
 
-The `Agent_suggestions` Google Sheets tab is the staging area for human review.
+The `Agent_suggestions` tab is the staging area for human review of AI suggestions; the pipeline's
+deterministic `Disagreements` tab follows the exact same workflow (see `../apps_script/GOOGLE_APP_SCRIPT.md` in the parent repo).
 
 - both AI-generated rows and deterministic ISSN-based `Alternative journal name` rows are staged in the same tab
 - each row has a `Status` column (pending / approve / reject); new rows are always uploaded as `pending`
+- each row records the verified target cell (`data_tab` / `target_row` / `target_col`) plus the
+  verification values (`journal`, `field`, `current_value`) so the Apps Script applies approvals
+  with a single verified cell write (no data-tab scans)
 - team members set the status to `approve` or `reject` after reviewing evidence
-- running **WhereToPublish → Apply Reviewed Suggestions** (Apps Script):
-  - `approve` rows: the suggestion is written to the appropriate data tab, then the row is immediately deleted from `Agent_suggestions` and archived in `Agent_suggestions_processed`
-  - `reject` rows: the row is immediately deleted and archived without any data change
+- running **WhereToPublish → Apply Reviewed Changes** (Apps Script):
+  - `approve` rows: the target cell is re-verified and `suggested_value` written into it, then the row is archived in `<tab>_processed` and deleted from the review tab
+  - `reject` rows: the row is archived and deleted without any data change
   - `pending` rows are left untouched
-  - each row is deleted as soon as it is archived; if the script times out, only unprocessed rows remain
+  - approvals whose verification fails (moved rows, changed cells, missing targets) stay in the review tab and are reported in the summary alert; re-runs are idempotent (already-applied cells are recognized)
 - the `Agent_suggestions_processed` tab accumulates all reviewed suggestions for performance analysis (see `NEXT_STEPS.md`)
 
 ## Persistence Contract
