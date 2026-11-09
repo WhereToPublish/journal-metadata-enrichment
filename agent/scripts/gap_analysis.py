@@ -90,7 +90,7 @@ def display_path(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def verify_extraction_data(wtp_dir: Path) -> None:
-    """Crash with a clear error if any required extraction file is missing.
+    """Raise RuntimeError if any required extraction file is missing.
 
     These files are owned by the WhereToPublish project and must be downloaded
     separately using scripts/download_extraction.sh inside that repo.
@@ -98,16 +98,20 @@ def verify_extraction_data(wtp_dir: Path) -> None:
     data_extraction = wtp_dir / "data_extraction"
     missing = [f for f in REQUIRED_EXTRACTION_FILES if not (data_extraction / f).exists()]
     if missing:
-        log(f"ERROR: Required extraction files not found in {display_path(data_extraction)}:")
-        for f in missing:
-            log(f"  missing: {f}")
-        log("Run 'bash scripts/download_extraction.sh' from the WhereToPublish repo root to populate them.")
-        sys.exit(1)
+        details = "\n".join(f"  missing: {f}" for f in missing)
+        raise RuntimeError(
+            f"Required extraction files not found in {display_path(data_extraction)}:\n"
+            f"{details}\n"
+            "Run 'bash scripts/download_extraction.sh' from the WhereToPublish repo root to populate them."
+        )
     log(f"  Extraction data: all {len(REQUIRED_EXTRACTION_FILES)} required files present")
 
 
-def download_all_sheets_csvs(wtp_dir: Path, credentials_path: Path | None = None) -> None:
-    """Download every sheet tab to data_extracted/<slug>.csv."""
+def download_all_sheets_csvs(wtp_dir: Path, credentials_path: Path | None = None) -> dict[str, int]:
+    """Download every sheet tab to data_extracted/<slug>.csv.
+
+    Read-only on the spreadsheet. Returns {tab_name: row_count}.
+    """
     data_extracted = wtp_dir / "data_extracted"
     data_extracted.mkdir(parents=True, exist_ok=True)
 
@@ -115,48 +119,51 @@ def download_all_sheets_csvs(wtp_dir: Path, credentials_path: Path | None = None
     try:
         service = _sheets_client.get_sheets_service(credentials_path=credentials_path, readonly=True)
     except Exception as exc:
-        log(f"ERROR: Could not authenticate with the Sheets API: {exc}")
-        sys.exit(1)
+        raise RuntimeError(f"Could not authenticate with the Sheets API: {exc}") from exc
 
+    downloaded: dict[str, int] = {}
     for slug, tab_name in _sheets_client.SHEET_TAB_NAMES.items():
         dest = data_extracted / f"{slug}.csv"
         try:
             rows = _sheets_client.download_tab_as_csv(service, tab_name, dest)
-            log(f"  {tab_name}: {len(rows)} rows downloaded")
         except Exception as exc:
-            log(f"ERROR: Could not download tab '{tab_name}': {exc}")
-            sys.exit(1)
+            raise RuntimeError(f"Could not download tab '{tab_name}': {exc}") from exc
+        downloaded[tab_name] = len(rows)
+        log(f"  {tab_name}: {len(rows)} rows downloaded")
+    return downloaded
 
 
 # ---------------------------------------------------------------------------
 # Pipeline runner
 # ---------------------------------------------------------------------------
 
-def run_pipeline(wtp_dir: Path) -> None:
-    """Run update_extracted.py and data_process.py inside the WTP repo directory."""
-    log("Running update_extracted.py ...")
-    result = subprocess.run(
-        [sys.executable, "scripts/update_extracted.py"],
-        cwd=str(wtp_dir),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        log(f"ERROR: update_extracted.py failed:\n{result.stderr[-2000:]}")
-        sys.exit(1)
-    log("  update_extracted.py: done")
+# The WTP process scripts run by the gap analysis (and the Studio workflow), in order.
+PIPELINE_SCRIPTS: tuple[str, ...] = ("scripts/update_extracted.py", "scripts/data_process.py")
 
-    log("Running data_process.py ...")
-    result = subprocess.run(
-        [sys.executable, "scripts/data_process.py"],
-        cwd=str(wtp_dir),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        log(f"ERROR: data_process.py failed:\n{result.stderr[-2000:]}")
-        sys.exit(1)
-    log("  data_process.py: done")
+
+def run_pipeline(wtp_dir: Path, scripts: tuple[str, ...] = PIPELINE_SCRIPTS) -> dict[str, str]:
+    """Run the WTP pipeline scripts inside the WTP repo directory.
+
+    The scripts write only local files (data_extracted/, data/, logs/) — they
+    never touch the Google Sheet. Returns {script: last 2000 chars of stderr on
+    failure}; raises RuntimeError when a script fails.
+    """
+    tails: dict[str, str] = {}
+    for script in scripts:
+        log(f"Running {script} ...")
+        result = subprocess.run(
+            [sys.executable, script],
+            cwd=str(wtp_dir),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "")[-2000:]
+            tails[script] = tail
+            raise RuntimeError(f"{script} failed:\n{tail}")
+        tails[script] = ""
+        log(f"  {script}: done")
+    return tails
 
 
 # ---------------------------------------------------------------------------
@@ -385,17 +392,21 @@ def main() -> None:
     log(f"WTP dir: {display_path(wtp_dir)}")
     log(f"Output : {display_path(args.output)}")
 
-    verify_extraction_data(wtp_dir)
+    try:
+        verify_extraction_data(wtp_dir)
 
-    if not args.skip_download:
-        download_all_sheets_csvs(wtp_dir, credentials_path=args.credentials)
-    else:
-        log("Skipping sheet downloads (--skip-download set)")
+        if not args.skip_download:
+            download_all_sheets_csvs(wtp_dir, credentials_path=args.credentials)
+        else:
+            log("Skipping sheet downloads (--skip-download set)")
 
-    if not args.skip_pipeline:
-        run_pipeline(wtp_dir)
-    else:
-        log("Skipping pipeline (--skip-pipeline set)")
+        if not args.skip_pipeline:
+            run_pipeline(wtp_dir)
+        else:
+            log("Skipping pipeline (--skip-pipeline set)")
+    except RuntimeError as exc:
+        log(f"ERROR: {exc}")
+        sys.exit(1)
 
     log("Building gap report ...")
     report = build_gap_report(wtp_dir)

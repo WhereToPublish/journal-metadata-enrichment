@@ -102,10 +102,15 @@ def build_review_rows(rows: list[dict], data_extracted_dir: Path) -> list[list]:
     return [OUTPUT_HEADERS] + data_rows
 
 
-def upload(input_csv: Path, credentials_path: Path | None, data_extracted_dir: Path) -> None:
+def upload(input_csv: Path, credentials_path: Path | None, data_extracted_dir: Path,
+           tab_name: str = SUGGESTIONS_TAB) -> dict:
+    """Upload the suggestions CSV to the given review tab. Returns a summary dict.
+
+    Raises FileNotFoundError when the input CSV is missing; the only tab this
+    project ever writes is the AI-suggestions review tab (Agent_suggestions).
+    """
     if not input_csv.exists():
-        print(f"ERROR: input file not found: {input_csv}", file=sys.stderr)
-        sys.exit(1)
+        raise FileNotFoundError(f"input file not found: {input_csv}")
 
     rows = load_suggestions(input_csv)
     rows, dropped_rows = dedupe_suggestions(rows)
@@ -115,19 +120,26 @@ def upload(input_csv: Path, credentials_path: Path | None, data_extracted_dir: P
 
     if not rows:
         print("No suggestions to upload — file is empty.")
-        return
+        return {"tab": tab_name, "rows_written": 0, "rows_in_csv": 0, "dropped_duplicates": dropped_rows}
 
     print(f"Uploading {len(rows)} suggestion(s) from {input_csv} ...")
     review_rows = build_review_rows(rows, data_extracted_dir)
 
     service = sheets_client.get_sheets_service(credentials_path=credentials_path, readonly=False)
-    review_common.upload_review_tab(
+    written = review_common.upload_review_tab(
         service=service, spreadsheet_id=sheets_client.SPREADSHEET_ID,
-        tab_name=SUGGESTIONS_TAB, rows=review_rows,
+        tab_name=tab_name, rows=review_rows,
     )
 
-    print(f"Done. {len(rows)} row(s) written to the '{SUGGESTIONS_TAB}' tab.")
+    print(f"Done. {written} row(s) written to the '{tab_name}' tab.")
     print(f"https://docs.google.com/spreadsheets/d/{sheets_client.SPREADSHEET_ID}/edit")
+    return {
+        "tab": tab_name,
+        "rows_written": written,
+        "rows_in_csv": len(rows),
+        "dropped_duplicates": dropped_rows,
+        "spreadsheet_id": sheets_client.SPREADSHEET_ID,
+    }
 
 
 def main() -> None:
@@ -157,7 +169,11 @@ def main() -> None:
         help="Directory with the data tab CSVs used to resolve suggestion targets",
     )
     args = parser.parse_args()
-    upload(args.input, args.credentials, args.data_extracted_dir)
+    try:
+        upload(args.input, args.credentials, args.data_extracted_dir)
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

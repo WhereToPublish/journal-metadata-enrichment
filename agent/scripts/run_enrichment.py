@@ -23,10 +23,11 @@ has never resolved in practice) are never sent to the swarm.
 from __future__ import annotations
 
 import argparse
+import asyncio
+from dataclasses import dataclass
 from datetime import datetime
 import json
 import os
-import subprocess
 import sys
 import urllib.parse
 from pathlib import Path
@@ -35,7 +36,6 @@ from typing import Any
 from agent_result import parse_result_file
 from enrichment_common import (
     DEFAULT_WTP_DIR,
-    GAP_ANALYSIS_SCRIPT,
     GAP_REPORT_PATH,
     LOGS_DIR,
     RUN_STATE_PATH,
@@ -364,78 +364,114 @@ def record_journal(state: dict[str, Any], state_path: Path, journal_name: str,
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Reusable core (used by the CLI main() and by the Mistral Studio workflow)
 # ---------------------------------------------------------------------------
 
-def run_gap_analysis(wtp_dir: Path, output_path: Path) -> None:
-    command = [sys.executable, str(GAP_ANALYSIS_SCRIPT), "--wtp-dir", str(wtp_dir), "--output", str(output_path)]
+@dataclass
+class EnrichmentConfig:
+    """Everything run_enrichment_core needs — plain data so the Studio workflow
+    activities can build it from JSON input."""
+
+    runtime: str = "omp"  # "omp" | "mistral"
+    mistral_model: str | None = None
+    mistral_concurrency: int = 0  # 0 = MistralSwarmRunner default (JOURNALMIND_MISTRAL_CONCURRENCY)
+    mistral_per_journal_timeout: float = 0.0  # 0 = default (JOURNALMIND_MISTRAL_TIMEOUT_SECONDS)
+    wtp_dir: Path = DEFAULT_WTP_DIR
+    gap_report: Path = GAP_REPORT_PATH
+    output: Path = SUGGESTIONS_CSV_PATH
+    state: Path = RUN_STATE_PATH
+    log_dir: Path = LOGS_DIR
+    journal: str = ""
+    journal_limit: int = 0
+    max_suggestions: int = 15
+    swarm_size: int = 32
+    swarm_timeout_seconds: int = DEFAULT_SWARM_TIMEOUT_SECONDS
+    credentials: Path | None = None
+
+
+def run_gap_analysis_step(
+    wtp_dir: Path,
+    output_path: Path,
+    credentials: Path | None = None,
+    skip_download: bool = False,
+    skip_pipeline: bool = False,
+) -> dict[str, Any]:
+    """Pull the Google Sheet tabs, run the WTP process scripts, write the gap report.
+
+    Sheet access here is read-only; the WTP scripts write only local files.
+    Returns the gap-report summary (the full report goes to output_path).
+    """
+    import gap_analysis
+
     log("Running gap analysis ...")
-    subprocess.run(command, check=True)
+    gap_analysis.verify_extraction_data(wtp_dir)
+    if not skip_download:
+        gap_analysis.download_all_sheets_csvs(wtp_dir, credentials_path=credentials)
+    else:
+        log("Skipping sheet downloads (--skip-download set)")
+    if not skip_pipeline:
+        gap_analysis.run_pipeline(wtp_dir)
+    else:
+        log("Skipping pipeline (--skip-pipeline set)")
+    report = gap_analysis.build_gap_report(wtp_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {
+        "tabs": report["tabs"],
+        "total_journals": report["total_journals"],
+        "journals_with_gaps": report["journals_with_gaps"],
+        "total_gap_instances": report["total_gap_instances"],
+        "priority_summary": report["priority_summary"],
+        "field_gap_counts": report["field_gap_counts"],
+        "gap_report": str(output_path),
+    }
 
 
 def load_gap_report(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run JournalMind enrichment (OMP swarm or Mistral Agents SDK runtime).")
-    parser.add_argument("--runtime", choices=("omp", "mistral"), default=os.environ.get("JOURNALMIND_RUNTIME", "omp"),
-                        help="Agent runtime: 'omp' (oh-my-pi swarm orchestrator) or 'mistral' "
-                             "(Mistral Agents SDK, one agent per journal). Default: JOURNALMIND_RUNTIME env, else 'omp'.")
-    parser.add_argument("--mistral-model", default=None,
-                        help="Mistral model for the mistral runtime (default: JOURNALMIND_MISTRAL_MODEL env, else ministral-3b-latest).")
-    parser.add_argument("--wtp-dir", type=Path, default=DEFAULT_WTP_DIR)
-    parser.add_argument("--gap-report", type=Path, default=GAP_REPORT_PATH)
-    parser.add_argument("--output", type=Path, default=SUGGESTIONS_CSV_PATH)
-    parser.add_argument("--state", type=Path, default=RUN_STATE_PATH)
-    parser.add_argument("--log-dir", type=Path, default=LOGS_DIR)
-    parser.add_argument("--skip-gap-analysis", action="store_true")
-    parser.add_argument("--journal", default="", help="Only process a single journal by exact name.")
-    parser.add_argument("--journal-limit", type=int, default=0,
-                        help="Stop after this many journals are sent to the swarm (0 = unlimited).")
-    parser.add_argument("--max-suggestions", type=int, default=15,
-                        help="Stop after this many valid suggestions are written (default: 15).")
-    parser.add_argument("--swarm-size", type=int, default=32,
-                        help="Journals per batch (default: 32).")
-    parser.add_argument("--swarm-timeout-seconds", type=int, default=DEFAULT_SWARM_TIMEOUT_SECONDS,
-                        help="Per-batch timeout: OMP swarm run / Mistral batch budget (default: 3600).")
-    parser.add_argument("--credentials", type=Path, default=None,
-                        help="Path to service-account JSON key (default: GOOGLE_SERVICE_ACCOUNT_KEY env var or default path).")
-    args = parser.parse_args()
+def _load_remote_keys(cfg: EnrichmentConfig) -> set[tuple[str, str, str]]:
+    """Blocking helper: read the remote dedup keys from the review tabs (read-only)."""
+    remote_service = sheets_client.get_sheets_service(
+        credentials_path=cfg.credentials, readonly=True
+    )
+    return load_suggestion_keys_from_tabs(
+        remote_service,
+        ["Agent_suggestions", "Agent_suggestions_processed"],
+    )
 
-    if args.swarm_timeout_seconds < 1:
-        parser.error("--swarm-timeout-seconds must be a positive integer")
-    if not 1 <= args.swarm_size <= 32:
-        parser.error("--swarm-size must be between 1 and 32")
-    if args.skip_gap_analysis and not args.gap_report.exists():
-        parser.error(f"--skip-gap-analysis requires an existing gap report at {args.gap_report}")
 
-    init_suggestions_csv(args.output)
-    state = load_state(args.state)
+async def run_enrichment_core_async(cfg: EnrichmentConfig) -> dict[str, Any]:
+    """Select the backlog from the gap report, dispatch batches to the runtime,
+    validate + persist results, and run the deterministic alt-name pass.
+
+    Async so it can run both from the CLI (via run_enrichment_core) and inside
+    the Mistral Studio workflow worker's event loop (activities). Returns a
+    JSON-serializable summary.
+    """
+    if cfg.swarm_timeout_seconds < 1:
+        raise ValueError("swarm_timeout_seconds must be a positive integer")
+    if not 1 <= cfg.swarm_size <= 32:
+        raise ValueError("swarm_size must be between 1 and 32")
+    if not cfg.gap_report.exists():
+        raise FileNotFoundError(f"gap report not found at {cfg.gap_report}")
+
+    init_suggestions_csv(cfg.output)
+    state = load_state(cfg.state)
     processed_names = {entry["journal"] for entry in state.get("processed_journals", [])}
-    existing_keys = load_existing_keys(args.output)
+    existing_keys = load_existing_keys(cfg.output)
 
     # Merge remote keys from Google Sheets so we never re-suggest values already
     # under review or already processed.
     try:
-        remote_service = sheets_client.get_sheets_service(
-            credentials_path=args.credentials, readonly=True
-        )
-        remote_keys = load_suggestion_keys_from_tabs(
-            remote_service,
-            ["Agent_suggestions", "Agent_suggestions_processed"],
-        )
+        remote_keys = await asyncio.to_thread(_load_remote_keys, cfg)
         existing_keys |= remote_keys
         log(f"Loaded {len(remote_keys)} existing key(s) from remote sheet tabs.")
     except Exception as exc:
         log(f"WARNING: could not load remote suggestion keys: {exc} — deduplication will use local CSV only.")
 
-    if not args.skip_gap_analysis:
-        run_gap_analysis(args.wtp_dir, args.gap_report)
-    else:
-        log("Skipping gap analysis (--skip-gap-analysis set)")
-
-    report = load_gap_report(args.gap_report)
+    report = load_gap_report(cfg.gap_report)
 
     # Harvest result files that earlier missions wrote but earlier runs never
     # collected (late-finishing subagents, interrupted runs).
@@ -444,15 +480,15 @@ def main() -> None:
         processed_names=processed_names,
         existing_keys=existing_keys,
         state=state,
-        state_path=args.state,
-        output=args.output,
+        state_path=cfg.state,
+        output=cfg.output,
     )
     if harvested:
         log(f"Harvested {harvested} leftover result file(s) from previous swarm missions.")
 
     journals = sorted(report["journals"], key=journal_max_priority)
-    if args.journal:
-        journals = [j for j in journals if j["name"] == args.journal]
+    if cfg.journal:
+        journals = [j for j in journals if j["name"] == cfg.journal]
 
     pending = [j for j in journals if j["name"] not in processed_names]
     skipped_unresolvable = [j for j in pending if is_unresolvable_only(j)]
@@ -465,23 +501,29 @@ def main() -> None:
     # Record skipped journals so subsequent runs do not rescan them.
     for journal_gap in skipped_unresolvable:
         record_journal(
-            state, args.state, journal_gap["name"],
+            state, cfg.state, journal_gap["name"],
             status="skipped",
             notes="Only Institution / Institution type gaps — never sent to the swarm.",
             session_id="",
             suggestions_written=0,
         )
 
-    if args.runtime == "mistral":
+    if cfg.runtime == "mistral":
+        runner_kwargs: dict[str, Any] = {}
+        if cfg.mistral_concurrency:
+            runner_kwargs["concurrency"] = cfg.mistral_concurrency
+        if cfg.mistral_per_journal_timeout:
+            runner_kwargs["per_journal_timeout"] = cfg.mistral_per_journal_timeout
         runner = MistralSwarmRunner(
-            args.log_dir,
-            batch_timeout_seconds=args.swarm_timeout_seconds,
-            model=args.mistral_model,
+            cfg.log_dir,
+            batch_timeout_seconds=cfg.swarm_timeout_seconds,
+            model=cfg.mistral_model,
+            **runner_kwargs,
         )
         log(f"Mistral runtime: model={runner.model}, concurrency={runner.concurrency}, "
             f"per-journal timeout={runner.per_journal_timeout:.0f}s")
     else:
-        runner = OMPSwarmRunner(args.log_dir, timeout_seconds=args.swarm_timeout_seconds)
+        runner = OMPSwarmRunner(cfg.log_dir, timeout_seconds=cfg.swarm_timeout_seconds)
     written_suggestions = 0
     processed_count = 0
     batch_number = 0
@@ -490,15 +532,15 @@ def main() -> None:
     # Batch the eligible backlog, highest gap priority first, until a budget runs out.
     start = 0
     while start < len(eligible):
-        if written_suggestions >= args.max_suggestions:
+        if written_suggestions >= cfg.max_suggestions:
             break
-        if args.journal_limit and processed_count >= args.journal_limit:
+        if cfg.journal_limit and processed_count >= cfg.journal_limit:
             break
 
         remaining = (
-            args.journal_limit - processed_count if args.journal_limit else len(eligible)
+            cfg.journal_limit - processed_count if cfg.journal_limit else len(eligible)
         )
-        batch = eligible[start:start + min(args.swarm_size, remaining)]
+        batch = eligible[start:start + min(cfg.swarm_size, remaining)]
         start += len(batch)
         batch_number += 1
         batch_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-batch{batch_number}"
@@ -506,11 +548,13 @@ def main() -> None:
 
         mission_dir = write_mission(batch_id, batch)
         log(f"Batch {batch_number}: dispatching {len(batch)} journal(s) "
-            f"({args.runtime} runtime) -> logs/{session_id}.*")
-        if args.runtime == "mistral":
-            run_result = runner.run(session_id=session_id, mission_dir=mission_dir, journals=batch)
+            f"({cfg.runtime} runtime) -> logs/{session_id}.*")
+        if cfg.runtime == "mistral":
+            run_result = await runner.run_async(session_id=session_id, mission_dir=mission_dir, journals=batch)
         else:
-            run_result = runner.run(session_id=session_id, prompt=build_orchestrator_prompt(mission_dir))
+            run_result = await asyncio.to_thread(
+                runner.run, session_id=session_id, prompt=build_orchestrator_prompt(mission_dir)
+            )
         if run_result.timed_out:
             log("WARNING: swarm run timed out; collecting whatever result files exist.")
         log(f"Runtime reply: {run_result.final_message.strip() or '(no final message)'}")
@@ -536,14 +580,14 @@ def main() -> None:
                     existing_keys=existing_keys,
                 )
 
-            append_suggestions(args.output, rows)
+            append_suggestions(cfg.output, rows)
             for row in rows:
                 existing_keys.add((row["journal"], row["field"], row["suggested_value"]))
             written_suggestions += len(rows)
             batch_rows_total += len(rows)
 
             record_journal(
-                state, args.state, journal_name,
+                state, cfg.state, journal_name,
                 status=status,
                 notes=notes,
                 session_id=session_id,
@@ -552,7 +596,7 @@ def main() -> None:
             log(f"  {journal_name}: status={status} suggestions={len(rows)} notes={notes or '-'}")
 
         checkpoint_path = STATE_DIR / f"checkpoint_suggestions_{batch_number}.csv"
-        write_checkpoint(args.output, checkpoint_path)
+        write_checkpoint(cfg.output, checkpoint_path)
         log(f"Batch {batch_number} complete: {len(batch)} journal(s), {batch_rows_total} suggestion(s) written.")
 
     # Late-result sweep: OMP's worker daemon keeps finishing in-flight subagents
@@ -573,12 +617,12 @@ def main() -> None:
                 agent_result=result,
                 existing_keys=existing_keys,
             )
-            append_suggestions(args.output, rows)
+            append_suggestions(cfg.output, rows)
             for row in rows:
                 existing_keys.add((row["journal"], row["field"], row["suggested_value"]))
             written_suggestions += len(rows)
             record_journal(
-                state, args.state, journal_name,
+                state, cfg.state, journal_name,
                 status=status,
                 notes=f"(late result) {notes}",
                 session_id=session_id,
@@ -587,8 +631,9 @@ def main() -> None:
             log(f"  {journal_name}: late result harvested — status={status} suggestions={len(rows)}")
 
     log("Enrichment complete — generating deterministic ISSN-based Alternative journal name suggestions ...")
+    deterministic_rows = 0
     try:
-        deterministic_rows = append_deterministic_suggestions(args.output, args.wtp_dir)
+        deterministic_rows = append_deterministic_suggestions(cfg.output, cfg.wtp_dir)
         log(f"  deterministic suggestions generated: {deterministic_rows}")
     except Exception as exc:
         log(f"WARNING: deterministic alt-name pass failed: {exc}")
@@ -596,8 +641,97 @@ def main() -> None:
     log("Run complete")
     log(f"  suggestions written : {written_suggestions}")
     log(f"  journals sent to swarm: {processed_count}")
-    log(f"  output               : {args.output}")
-    log(f"  state                : {args.state}")
+    log(f"  output               : {cfg.output}")
+    log(f"  state                : {cfg.state}")
+    return {
+        "suggestions_written": written_suggestions,
+        "deterministic_suggestions": deterministic_rows,
+        "journals_dispatched": processed_count,
+        "batches": batch_number,
+        "harvested_leftovers": harvested,
+        "skipped_unresolvable": len(skipped_unresolvable),
+        "eligible_backlog": len(eligible),
+        "output": str(cfg.output),
+        "state": str(cfg.state),
+    }
+
+
+def run_enrichment_core(cfg: EnrichmentConfig) -> dict[str, Any]:
+    """Sync entry point (CLI): run the enrichment core in a fresh event loop."""
+    return asyncio.run(run_enrichment_core_async(cfg))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run JournalMind enrichment (OMP swarm or Mistral Agents SDK runtime).")
+    parser.add_argument("--runtime", choices=("omp", "mistral"), default=os.environ.get("JOURNALMIND_RUNTIME", "omp"),
+                        help="Agent runtime: 'omp' (oh-my-pi swarm orchestrator) or 'mistral' "
+                             "(Mistral Agents SDK, one agent per journal). Default: JOURNALMIND_RUNTIME env, else 'omp'.")
+    parser.add_argument("--mistral-model", default=None,
+                        help="Mistral model for the mistral runtime (default: JOURNALMIND_MISTRAL_MODEL env, else ministral-3b-latest).")
+    parser.add_argument("--wtp-dir", type=Path, default=DEFAULT_WTP_DIR)
+    parser.add_argument("--gap-report", type=Path, default=GAP_REPORT_PATH)
+    parser.add_argument("--output", type=Path, default=SUGGESTIONS_CSV_PATH)
+    parser.add_argument("--state", type=Path, default=RUN_STATE_PATH)
+    parser.add_argument("--log-dir", type=Path, default=LOGS_DIR)
+    parser.add_argument("--skip-gap-analysis", action="store_true")
+    parser.add_argument("--skip-download", action="store_true",
+                        help="With gap analysis: reuse the existing data_extracted/ CSVs.")
+    parser.add_argument("--skip-pipeline", action="store_true",
+                        help="With gap analysis: skip update_extracted.py / data_process.py.")
+    parser.add_argument("--journal", default="", help="Only process a single journal by exact name.")
+    parser.add_argument("--journal-limit", type=int, default=0,
+                        help="Stop after this many journals are sent to the swarm (0 = unlimited).")
+    parser.add_argument("--max-suggestions", type=int, default=15,
+                        help="Stop after this many valid suggestions are written (default: 15).")
+    parser.add_argument("--swarm-size", type=int, default=32,
+                        help="Journals per batch (default: 32).")
+    parser.add_argument("--swarm-timeout-seconds", type=int, default=DEFAULT_SWARM_TIMEOUT_SECONDS,
+                        help="Per-batch timeout: OMP swarm run / Mistral batch budget (default: 3600).")
+    parser.add_argument("--credentials", type=Path, default=None,
+                        help="Path to service-account JSON key (default: GOOGLE_SERVICE_ACCOUNT_KEY env var or default path).")
+    args = parser.parse_args()
+
+    if args.swarm_timeout_seconds < 1:
+        parser.error("--swarm-timeout-seconds must be a positive integer")
+    if not 1 <= args.swarm_size <= 32:
+        parser.error("--swarm-size must be between 1 and 32")
+    if args.skip_gap_analysis and not args.gap_report.exists():
+        parser.error(f"--skip-gap-analysis requires an existing gap report at {args.gap_report}")
+
+    if not args.skip_gap_analysis:
+        try:
+            run_gap_analysis_step(
+                args.wtp_dir, args.gap_report,
+                credentials=args.credentials,
+                skip_download=args.skip_download,
+                skip_pipeline=args.skip_pipeline,
+            )
+        except (RuntimeError, FileNotFoundError) as exc:
+            log(f"ERROR: gap analysis failed: {exc}")
+            sys.exit(1)
+    else:
+        log("Skipping gap analysis (--skip-gap-analysis set)")
+
+    cfg = EnrichmentConfig(
+        runtime=args.runtime,
+        mistral_model=args.mistral_model,
+        wtp_dir=args.wtp_dir,
+        gap_report=args.gap_report,
+        output=args.output,
+        state=args.state,
+        log_dir=args.log_dir,
+        journal=args.journal,
+        journal_limit=args.journal_limit,
+        max_suggestions=args.max_suggestions,
+        swarm_size=args.swarm_size,
+        swarm_timeout_seconds=args.swarm_timeout_seconds,
+        credentials=args.credentials,
+    )
+    run_enrichment_core(cfg)
 
 
 if __name__ == "__main__":

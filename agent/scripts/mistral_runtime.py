@@ -357,24 +357,29 @@ class MistralSwarmRunner:
         self.stats = {"ok": 0, "unresolved": 0, "error": 0, "retry": 0}
         return SwarmRunResult(session_id=session_id, final_message=final_message)
 
-    def run(self, session_id: str, mission_dir: Path,
-            journals: list[dict[str, Any]]) -> SwarmRunResult:
-        """Write one result file per journal; enforce the overall batch timeout."""
+    @staticmethod
+    def _indexed(journals: list[dict[str, Any]]) -> list[dict[str, Any]]:
         indexed: list[dict[str, Any]] = []
         for index, journal_gap in enumerate(journals):
             entry = dict(journal_gap)
             entry["_index"] = index
             entry["_slug"] = slugify(journal_gap["name"])
             indexed.append(entry)
+        return indexed
 
-        async def guarded() -> SwarmRunResult:
+    async def run_async(self, session_id: str, mission_dir: Path,
+                        journals: list[dict[str, Any]]) -> SwarmRunResult:
+        """Write one result file per journal; enforce the overall batch timeout.
+
+        Async so it can run inside the Mistral Studio workflow worker's event
+        loop (activities) as well as standalone.
+        """
+        indexed = self._indexed(journals)
+        try:
             return await asyncio.wait_for(
                 self._run_batch(session_id, mission_dir, indexed),
                 timeout=self.batch_timeout_seconds,
             )
-
-        try:
-            return asyncio.run(guarded())
         except TimeoutError:
             return SwarmRunResult(
                 session_id=session_id,
@@ -384,3 +389,8 @@ class MistralSwarmRunner:
                     "that finished; the rest were left for the late-result sweep and the next run."
                 ),
             )
+
+    def run(self, session_id: str, mission_dir: Path,
+            journals: list[dict[str, Any]]) -> SwarmRunResult:
+        """Sync wrapper (CLI use): write one result file per journal per batch."""
+        return asyncio.run(self.run_async(session_id, mission_dir, journals))
